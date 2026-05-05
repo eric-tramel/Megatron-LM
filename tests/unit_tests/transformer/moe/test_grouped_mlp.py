@@ -65,7 +65,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             device,
             dtype,
             accumulate_into_main_grad,
-            single_grouped_parameter,
+            single_grouped_weight,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -75,7 +75,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             self.device = device
             self.dtype = dtype
             self.fuse_wgrad_accumulation = accumulate_into_main_grad
-            self.single_grouped_parameter = single_grouped_parameter
+            self.single_grouped_weight = single_grouped_weight
 
         def need_backward_dw(self):
             return False
@@ -112,7 +112,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
         device="cuda",
         dtype=torch.bfloat16,
         accumulate_into_main_grad=True,
-        single_grouped_parameter=False,
+        single_grouped_weight=False,
     )
     module.linear_fc2 = FakeGroupedLinear(
         2,
@@ -122,7 +122,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
         device="cuda",
         dtype=torch.bfloat16,
         accumulate_into_main_grad=False,
-        single_grouped_parameter=True,
+        single_grouped_weight=True,
     )
     module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
     module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4) * 2)
@@ -246,7 +246,7 @@ def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
         hook(object())
 
 
-def test_make_fused_ops_handles_single_grouped_parameter_for_fc1(monkeypatch):
+def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(
             self,
@@ -258,7 +258,7 @@ def test_make_fused_ops_handles_single_grouped_parameter_for_fc1(monkeypatch):
             device,
             dtype,
             accumulate_into_main_grad,
-            single_grouped_parameter,
+            single_grouped_weight,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -268,7 +268,7 @@ def test_make_fused_ops_handles_single_grouped_parameter_for_fc1(monkeypatch):
             self.device = device
             self.dtype = dtype
             self.fuse_wgrad_accumulation = accumulate_into_main_grad
-            self.single_grouped_parameter = single_grouped_parameter
+            self.single_grouped_weight = single_grouped_weight
 
         def need_backward_dw(self):
             return False
@@ -305,7 +305,7 @@ def test_make_fused_ops_handles_single_grouped_parameter_for_fc1(monkeypatch):
         device="cuda",
         dtype=torch.bfloat16,
         accumulate_into_main_grad=False,
-        single_grouped_parameter=True,
+        single_grouped_weight=True,
     )
     module.linear_fc2 = FakeGroupedLinear(
         2,
@@ -315,7 +315,7 @@ def test_make_fused_ops_handles_single_grouped_parameter_for_fc1(monkeypatch):
         device="cuda",
         dtype=torch.bfloat16,
         accumulate_into_main_grad=True,
-        single_grouped_parameter=False,
+        single_grouped_weight=False,
     )
     module.linear_fc1.weight = torch.nn.Parameter(torch.ones(2, 8, 4))
     module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
@@ -512,9 +512,9 @@ class TestTEGroupedMLP:
             pytest.skip("TE op fuser API not available")
         import inspect
 
-        if "single_grouped_parameter" not in inspect.signature(GroupedLinear.__init__).parameters:
+        if "single_grouped_weight" not in inspect.signature(GroupedLinear.__init__).parameters:
             pytest.skip(
-                "Installed TE op fuser GroupedLinear lacks `single_grouped_parameter` kwarg; "
+                "Installed TE op fuser GroupedLinear lacks `single_grouped_weight` kwarg; "
                 "_make_fused_ops requires a TE build that exposes it."
             )
 
@@ -560,12 +560,12 @@ class TestTEGroupedMLP:
         # Weights of the wrapper ops must alias the underlying GroupedLinear
         # parameters so optimizer updates are visible to the fused path.
         for idx in range(experts.linear_fc1.num_gemms):
-            if not experts.linear_fc1.single_grouped_parameter:
+            if not getattr(experts.linear_fc1, "single_grouped_weight", False):
                 assert getattr(ops[0], f"weight{idx}") is getattr(
                     experts.linear_fc1, f"weight{idx}"
                 )
         for idx in range(experts.linear_fc2.num_gemms):
-            if not experts.linear_fc2.single_grouped_parameter:
+            if not getattr(experts.linear_fc2, "single_grouped_weight", False):
                 assert getattr(ops[2], f"weight{idx}") is getattr(
                     experts.linear_fc2, f"weight{idx}"
                 )
