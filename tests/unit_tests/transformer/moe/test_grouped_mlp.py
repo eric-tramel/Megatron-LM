@@ -56,6 +56,8 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             dtype,
             accumulate_into_main_grad,
             single_grouped_weight,
+            single_grouped_bias=False,
+            delay_wgrad_compute=False,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -66,6 +68,8 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             self.dtype = dtype
             self.fuse_wgrad_accumulation = accumulate_into_main_grad
             self.single_grouped_weight = single_grouped_weight
+            self.single_grouped_bias = single_grouped_bias
+            self.delay_wgrad_compute = delay_wgrad_compute
 
         def need_backward_dw(self):
             return False
@@ -93,7 +97,11 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
-    module.config = SimpleNamespace(moe_mlp_glu_interleave_size=16)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=16, delay_wgrad_compute=False, activation_func_clamp_value=None
+    )
+    module.activation_func = F.silu
+    module.config.gated_linear_unit = True
     module.linear_fc1 = FakeGroupedLinear(
         2,
         4,
@@ -240,6 +248,8 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
             dtype,
             accumulate_into_main_grad,
             single_grouped_weight,
+            single_grouped_bias=False,
+            delay_wgrad_compute=False,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -250,6 +260,8 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
             self.dtype = dtype
             self.fuse_wgrad_accumulation = accumulate_into_main_grad
             self.single_grouped_weight = single_grouped_weight
+            self.single_grouped_bias = single_grouped_bias
+            self.delay_wgrad_compute = delay_wgrad_compute
 
         def need_backward_dw(self):
             return False
@@ -277,7 +289,13 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
-    module.config = SimpleNamespace(moe_mlp_glu_interleave_size=8)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=8,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        gated_linear_unit=True,
+    )
+    module.activation_func = F.silu
     module.linear_fc1 = FakeGroupedLinear(
         2,
         4,
