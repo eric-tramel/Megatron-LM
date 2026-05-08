@@ -124,8 +124,35 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel,
+        # use_layerwise_distributed_optimizer).
         buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
+
+        # Validate layerwise buffer requirements.
+        has_layerwise_buffers = any(
+            key.use_layerwise_distributed_optimizer for key in buffer_groups
+        )
+        if has_layerwise_buffers:
+            # use_layerwise_distributed_optimizer=True buffers exist to support the
+            # layout-driven optimizer path: the published layout is consumed via
+            # `_shard_params_from_layout`, which derives ownership from buffer offsets
+            # and assumes reduce-scatter has populated each rank's shard. That whole
+            # path requires `use_distributed_optimizer=True` (so that model params are
+            # views into the param buffer and grads reduce-scatter into per-rank shards
+            # of the grad buffer). The legacy all-reduce path is still available, but
+            # it bypasses the layout entirely (uses the ping-pong fallback) and so
+            # mustn't be combined with layerwise-tagged buffers.
+            assert self.ddp_config.use_distributed_optimizer, (
+                "Buffers with use_layerwise_distributed_optimizer=True require "
+                "ddp_config.use_distributed_optimizer=True. The layout-driven layerwise "
+                "optimizer path is built on reduce-scatter + buffer-views; use the "
+                "ping-pong fallback (no layout) if you need an all-reduce path instead."
+            )
+            assert full_param_layout is not None, (
+                "Buffers with use_layerwise_distributed_optimizer=True require a "
+                "pre-computed full_param_layout. Use "
+                "LayerWiseDistributedOptimizer.compute_full_param_layout() to compute it."
+            )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
@@ -164,6 +191,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 assert (
                     param_indices == layout.param_indices
                 ), f"param_indices for {buffer_key} do not match between grouping and layout"
+
+        self.full_param_layout = full_param_layout
 
         # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
@@ -249,6 +278,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
+                buffer_key=buffer_key,
             )
             if buffer_key.is_expert_parallel:
                 self.expert_parallel_buffers.append(buffer)

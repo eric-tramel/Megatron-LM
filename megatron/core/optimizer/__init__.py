@@ -447,6 +447,36 @@ def _get_param_groups_and_buffers(
     return param_groups, buffers
 
 
+def _setup_distributed_optimizer_process_groups(
+    pg_collection: Optional[ProcessGroupCollection],
+    model_chunks: List[MegatronModule],
+    use_gloo_process_groups: bool,
+) -> Dict[str, Any]:
+    """Set up the process groups needed to construct a DistributedOptimizer.
+
+    Calls :meth:`ProcessGroupCollection.setup_process_groups_for_optimizer` and
+    extends the returned dict with the two derived values that every caller
+    computes from it:
+
+    * ``model_parallel_rank``: this rank's index within ``mp_group``.
+    * ``distributed_optimizer_instance_id``: the rank within the inter-instance
+      group when multiple distributed-optimizer instances are configured, else 0.
+    """
+    process_groups_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection, model_chunks, use_gloo_process_groups
+    )
+    process_groups_dict['model_parallel_rank'] = get_pg_rank(process_groups_dict['mp_group'])
+    if get_pg_size(process_groups_dict['dp_cp_group']) > get_pg_size(
+        process_groups_dict['intra_dp_cp_group']
+    ):
+        process_groups_dict['distributed_optimizer_instance_id'] = get_pg_rank(
+            process_groups_dict['inter_dist_opt_group']
+        )
+    else:
+        process_groups_dict['distributed_optimizer_instance_id'] = 0
+    return process_groups_dict
+
+
 def _get_megatron_optimizer_based_on_param_groups(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -781,16 +811,21 @@ def _get_megatron_emerging_optimizer(
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
     config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
 
-    # Build param groups and bucket by (optimizer_name, is_expert_parallel).
-    # Layer-wise distributed optimizer handles expert params internally so we skip that split.
     all_param_groups = _get_param_groups(model_chunks, config, config_overrides)
+
+    if use_layer_wise:
+        return _build_layerwise_chained_optimizer(
+            config, model_chunks, all_param_groups, eopt_name, pg_collection
+        )
+
+    # Non-layerwise path: bucket param groups by (optimizer_name, is_expert_parallel)
+    # and build one optimizer per bucket, combining via ChainedOptimizer.
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
-        is_expert = group['is_expert_parallel'] and not use_layer_wise
+        is_expert = group['is_expert_parallel']
         grouped_param_groups[(opt_name, is_expert)].append(group)
 
-    # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     results = []
     for (opt_name, is_expert), groups in grouped_param_groups.items():
         if not groups:
@@ -802,22 +837,19 @@ def _get_megatron_emerging_optimizer(
             optimizer, init_state_fn = _create_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
-            if use_layer_wise:
-                result = (optimizer, init_state_fn)
+            if config.bf16:
+                optimizer = Float16OptimizerWithFloat16Params(
+                    optimizer, config, None, init_state_fn
+                )
             else:
-                if config.bf16:
-                    optimizer = Float16OptimizerWithFloat16Params(
-                        optimizer, config, None, init_state_fn
-                    )
-                else:
-                    optimizer = FP32Optimizer(optimizer, config, init_state_fn)
-                setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
-                if pg_collection is None or not hasattr(pg_collection, 'tp'):
-                    tp_group = parallel_state.get_tensor_model_parallel_group()
-                else:
-                    tp_group = pg_collection.tp
-                setattr(optimizer, 'tp_group', tp_group)
-                result = optimizer
+                optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+            setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+            if pg_collection is None or not hasattr(pg_collection, 'tp'):
+                tp_group = parallel_state.get_tensor_model_parallel_group()
+            else:
+                tp_group = pg_collection.tp
+            setattr(optimizer, 'tp_group', tp_group)
+            result = optimizer
         else:
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
@@ -828,32 +860,219 @@ def _get_megatron_emerging_optimizer(
                 param_groups=groups,
                 model_parallel_group=model_parallel_group,
                 pg_collection=pg_collection,
-                skip_megatron_wrapping=use_layer_wise,
             )
             # TODO(deyuf): ChainedOptimizer currently asserts all sub-optimizers
             # share the same config. Revisit this design now that emerging
             # optimizers mix different optimizer types (e.g. Muon + Adam).
             # For now, reset to the top-level config so the assertion holds.
-            if not use_layer_wise and hasattr(result, 'config'):
+            if hasattr(result, 'config'):
                 result.config = config
         results.append(result)
 
-    if use_layer_wise:
-        base_optimizers, init_fns = (), ()
-        if results:
-            base_optimizers, init_fns = zip(*results)
+    return ChainedOptimizer(results)
+
+
+def _build_layerwise_chained_optimizer(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    all_param_groups: List[Dict],
+    eopt_name: str,
+    pg_collection: ProcessGroupCollection,
+) -> MegatronOptimizer:
+    """Build the optimizer for ``use_layer_wise_distributed_optimizer=True`` mode.
+
+    Splits param groups by routing:
+      * Emerging-optimizer groups (e.g. Muon) → wrapped together by
+        :class:`LayerWiseDistributedOptimizer`. LayerWise mixes dense and
+        expert in one wrapper because it manages expert sharding internally.
+      * Non-emerging groups (Adam-routed: biases, norms, embeddings, output) →
+        wrapped by :class:`DistributedOptimizer` with byte-level sub-tensor
+        sharding. Adam's element-wise update works correctly on sub-tensor
+        slices, so big params (e.g. tied embeddings) avoid the per-shard
+        padding the layerwise scheme would otherwise require. Dense and
+        expert get separate DistOpts (different DP groups).
+
+    The two paths are combined with :class:`ChainedOptimizer`.
+    """
+    assert not config.overlap_param_gather_with_optimizer_step, (
+        "overlap_param_gather_with_optimizer_step is not supported with "
+        "use_layer_wise_distributed_optimizer=True."
+    )
+
+    # Partition param groups. LayerWise manages expert sharding internally so dense
+    # and expert emerging-optimizer groups go into one wrapper; DistOpt does not, so
+    # its dense and expert groups are split into separate DistributedOptimizers.
+    layerwise_groups: Dict[str, List[Dict]] = defaultdict(list)  # opt_name -> groups
+    distopt_dense_groups: List[Dict] = []
+    distopt_expert_groups: List[Dict] = []
+    for group in all_param_groups:
+        group_opt_name = group.get('optimizer', eopt_name)
+        if group_opt_name in _EMERGING_OPTIMIZERS:
+            layerwise_groups[group_opt_name].append(group)
+        elif group['is_expert_parallel']:
+            distopt_expert_groups.append(group)
+        else:
+            distopt_dense_groups.append(group)
+
+    # Build raw emerging optimizers (one per emerging-optimizer name) for LayerWise.
+    emerging_optimizers: List[Tuple[Any, Callable]] = []
+    for emerging_name, groups in layerwise_groups.items():
+        # eopt_name is the top-level emerging optimizer; sub-buckets keyed by their
+        # own opt_name go through the same factory.
+        optimizer, init_state_fn = _create_emerging_optimizer(
+            config, groups, emerging_name, model_chunks, pg_collection
+        )
+        emerging_optimizers.append((optimizer, init_state_fn))
+
+    all_optimizers: List[MegatronOptimizer] = []
+    if emerging_optimizers:
+        base_optimizers, init_fns = zip(*emerging_optimizers)
         log_single_rank(
             logger, logging.INFO, f'Using LayerWiseDistributedOptimizer for {eopt_name}'
         )
-        return LayerWiseDistributedOptimizer(
-            list(base_optimizers),
-            config,
-            pg_collection,
-            init_state_fn_list=list(init_fns),
-            model_chunks=model_chunks if config.overlap_param_gather else None,
+        all_optimizers.append(
+            LayerWiseDistributedOptimizer(
+                list(base_optimizers),
+                config,
+                pg_collection,
+                init_state_fn_list=list(init_fns),
+                model_chunks=model_chunks,
+            )
         )
 
-    return ChainedOptimizer(results)
+    # Build DistributedOptimizers for Adam-routed buckets, if any.
+    if distopt_dense_groups or distopt_expert_groups:
+        all_optimizers.extend(
+            _build_distopt_optimizers_for_layerwise_adam_groups(
+                config=config,
+                model_chunks=model_chunks,
+                distopt_dense_groups=distopt_dense_groups,
+                distopt_expert_groups=distopt_expert_groups,
+                pg_collection=pg_collection,
+            )
+        )
+
+    assert all_optimizers, (
+        "Layerwise mode produced no optimizers — every param group was filtered out. "
+        "Check that at least some params are routed to an emerging optimizer or to a "
+        "fallback (e.g. Adam)."
+    )
+    if len(all_optimizers) == 1:
+        return all_optimizers[0]
+    return ChainedOptimizer(all_optimizers)
+
+
+def _build_distopt_optimizers_for_layerwise_adam_groups(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    distopt_dense_groups: List[Dict],
+    distopt_expert_groups: List[Dict],
+    pg_collection: ProcessGroupCollection,
+) -> List[MegatronOptimizer]:
+    """Build :class:`DistributedOptimizer` instances for Adam-routed buckets.
+
+    In layerwise mode, non-emerging-optimizer buckets (Adam, SGD, …) are
+    handled by their own DistributedOptimizer rather than by LayerWise.
+    Each DistOpt receives only the buffers tagged
+    ``use_layerwise_distributed_optimizer=False``; the other buffers are
+    managed by LayerWise. Dense and expert get separate DistOpts.
+    """
+    # All distopt buckets must currently use the same opt_name (e.g. all 'adam').
+    all_distopt_opt_names = {
+        g.get('optimizer') for g in distopt_dense_groups + distopt_expert_groups
+    }
+    all_distopt_opt_names.discard(None)
+    assert len(all_distopt_opt_names) == 1, (
+        "Layerwise mode currently supports a single non-emerging optimizer for the "
+        f"fallback buckets, got: {all_distopt_opt_names}"
+    )
+    distopt_opt_name = next(iter(all_distopt_opt_names))
+
+    # pg_collection is always non-None in the layerwise path (resolved at the top of
+    # _get_megatron_emerging_optimizer if the caller didn't pass one), and
+    # setup_process_groups_for_optimizer rejects gloo when pg_collection is provided.
+    process_groups_dict = _setup_distributed_optimizer_process_groups(
+        pg_collection, model_chunks, use_gloo_process_groups=False
+    )
+    intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
+    intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
+    mp_group = process_groups_dict['mp_group']
+    expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
+    intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
+    intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
+    intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
+    model_parallel_rank = process_groups_dict['model_parallel_rank']
+    distributed_optimizer_instance_id = process_groups_dict['distributed_optimizer_instance_id']
+
+    def _filter_buffers(buffer_attr_name: str) -> Dict[int, List[_ParamAndGradBuffer]]:
+        # Keep only buffers tagged use_layerwise_distributed_optimizer=False —
+        # the others are managed by LayerWiseDistributedOptimizer.
+        result: Dict[int, List[_ParamAndGradBuffer]] = {}
+        for chunk_idx, chunk in enumerate(model_chunks):
+            buffers = getattr(chunk, buffer_attr_name, [])
+            result[chunk_idx] = [
+                b
+                for b in buffers
+                if b.buffer_key is not None and not b.buffer_key.use_layerwise_distributed_optimizer
+            ]
+        return result
+
+    def _build_distopt(
+        param_groups: List[Dict],
+        buffer_attr_name: str,
+        model_parallel_group_,
+        data_parallel_group_,
+        data_parallel_group_gloo_,
+        data_parallel_group_idx_,
+    ) -> MegatronOptimizer:
+        per_model_buffers = _filter_buffers(buffer_attr_name)
+        adam_config = copy.copy(config)
+        adam_config.optimizer = distopt_opt_name
+        adam_config.use_distributed_optimizer = True
+        optimizer = _get_megatron_optimizer_based_on_param_groups(
+            config=adam_config,
+            model_chunks=model_chunks,
+            param_groups=param_groups,
+            per_model_buffers=per_model_buffers,
+            model_parallel_group=model_parallel_group_,
+            data_parallel_group=data_parallel_group_,
+            data_parallel_group_gloo=data_parallel_group_gloo_,
+            data_parallel_group_idx=data_parallel_group_idx_,
+            intra_dist_opt_group=intra_dist_opt_group,
+            distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+            pg_collection=pg_collection,
+        )
+        # ChainedOptimizer asserts all sub-optimizers share the same config.
+        # Reset to the top-level config so the assertion holds.
+        if hasattr(optimizer, 'config'):
+            optimizer.config = config
+        return optimizer
+
+    distopt_optimizers: List[MegatronOptimizer] = []
+    if distopt_dense_groups:
+        distopt_optimizers.append(
+            _build_distopt(
+                distopt_dense_groups,
+                buffer_attr_name='buffers',
+                model_parallel_group_=mp_group,
+                data_parallel_group_=intra_dp_cp_group,
+                data_parallel_group_gloo_=intra_dp_cp_group_gloo,
+                data_parallel_group_idx_=model_parallel_rank,
+            )
+        )
+    if distopt_expert_groups:
+        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
+        distopt_optimizers.append(
+            _build_distopt(
+                distopt_expert_groups,
+                buffer_attr_name='expert_parallel_buffers',
+                model_parallel_group_=expt_tp_pp_group,
+                data_parallel_group_=intra_expt_dp_group,
+                data_parallel_group_gloo_=intra_expt_dp_group_gloo,
+                data_parallel_group_idx_=expt_model_parallel_rank,
+            )
+        )
+    return distopt_optimizers
 
 
 def get_megatron_optimizer(
@@ -914,10 +1133,9 @@ def get_megatron_optimizer(
         overlap_param_gather_with_optimizer_step_flags = [False]
 
     # Setup process groups using helper method
-    process_groups_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
+    process_groups_dict = _setup_distributed_optimizer_process_groups(
         pg_collection, model_chunks, use_gloo_process_groups
     )
-
     dp_cp_group = process_groups_dict['dp_cp_group']
     intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
     intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
@@ -926,14 +1144,8 @@ def get_megatron_optimizer(
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
-
-    model_parallel_rank = get_pg_rank(mp_group)
-
-    if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
-        inter_dist_opt_group = process_groups_dict['inter_dist_opt_group']
-        distributed_optimizer_instance_id = get_pg_rank(inter_dist_opt_group)
-    else:
-        distributed_optimizer_instance_id = 0
+    model_parallel_rank = process_groups_dict['model_parallel_rank']
+    distributed_optimizer_instance_id = process_groups_dict['distributed_optimizer_instance_id']
 
     optimizers = []
     model_chunk_offset = 0

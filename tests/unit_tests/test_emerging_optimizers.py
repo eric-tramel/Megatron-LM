@@ -274,17 +274,27 @@ class TestMuonOptimizerMultiRank:
             muon_tp_mode="duplicated",
         )
 
-        # use_layer_wise_distributed_optimizer=True triggers LayerWiseDistributedOptimizer
+        # use_layer_wise_distributed_optimizer=True returns a ChainedOptimizer
+        # containing a LayerWiseDistributedOptimizer (for Muon-managed weights)
+        # and a DistributedOptimizer (for Adam-managed biases / norms).
         optimizer = get_megatron_optimizer(
             config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
 
-        # Verify it's a LayerWiseDistributedOptimizer
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
         from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+        from megatron.core.optimizer.optimizer import ChainedOptimizer
 
         assert isinstance(
-            optimizer, LayerWiseDistributedOptimizer
-        ), "Should return LayerWiseDistributedOptimizer"
+            optimizer, ChainedOptimizer
+        ), "Layerwise mode with mixed Muon + Adam params should return a ChainedOptimizer"
+        children = optimizer.chained_optimizers
+        assert any(
+            isinstance(c, LayerWiseDistributedOptimizer) for c in children
+        ), "ChainedOptimizer should contain a LayerWiseDistributedOptimizer for Muon weights"
+        assert any(
+            isinstance(c, DistributedOptimizer) for c in children
+        ), "ChainedOptimizer should contain a DistributedOptimizer for Adam-routed params"
 
         # Test forward and backward pass
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
@@ -328,12 +338,18 @@ class TestMuonOptimizerMultiRank:
             config=optimizer_config, model_chunks=[model], layer_wise_distributed_optimizer=True
         )
 
-        # Verify it's a LayerWiseDistributedOptimizer
+        # Layerwise mode with mixed Muon + Adam params returns a ChainedOptimizer
+        # containing a LayerWiseDistributedOptimizer and a DistributedOptimizer.
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
         from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+        from megatron.core.optimizer.optimizer import ChainedOptimizer
 
         assert isinstance(
-            optimizer, LayerWiseDistributedOptimizer
-        ), "Should return LayerWiseDistributedOptimizer"
+            optimizer, ChainedOptimizer
+        ), "Layerwise mode with mixed Muon + Adam params should return a ChainedOptimizer"
+        children = optimizer.chained_optimizers
+        assert any(isinstance(c, LayerWiseDistributedOptimizer) for c in children)
+        assert any(isinstance(c, DistributedOptimizer) for c in children)
 
         # Test forward and backward pass
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
