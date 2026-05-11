@@ -34,7 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as torch_dcp
-from torch.distributed.checkpoint import FileSystemWriter
+from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
 from torch.distributed.checkpoint.default_planner import create_default_global_save_plan
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
@@ -1087,14 +1087,24 @@ def _prepare_temporary_output_dir(output_dir: Path, overwrite_output: bool) -> P
     return temporary_dir
 
 
+def _require_publishable_checkpoint_dir(checkpoint_dir: Path) -> None:
+    if not (checkpoint_dir / "metadata.json").exists():
+        raise WeightedMergeError(
+            f"Refusing to publish {checkpoint_dir} because distributed checkpoint metadata is missing."
+        )
+    try:
+        FileSystemReader(checkpoint_dir).read_metadata()
+    except Exception as exc:
+        raise WeightedMergeError(
+            f"Refusing to publish {checkpoint_dir} because DCP metadata is missing or unreadable."
+        ) from exc
+
+
 def _publish_temporary_output_dir(
     temporary_dir: Path, output_dir: Path, *, overwrite_output: bool
 ) -> None:
     def publish() -> None:
-        if not (temporary_dir / "metadata.json").exists():
-            raise WeightedMergeError(
-                f"Refusing to publish {temporary_dir} because distributed checkpoint metadata is missing."
-            )
+        _require_publishable_checkpoint_dir(temporary_dir)
         if output_dir.exists():
             if not overwrite_output:
                 raise WeightedMergeError(

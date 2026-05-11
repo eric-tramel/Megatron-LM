@@ -391,6 +391,25 @@ def test_weighted_merge_product_code_imports_no_private_dcp_filesystem_symbols()
             assert node.module != "torch.distributed.checkpoint.filesystem"
 
 
+def test_publish_temporary_output_dir_requires_public_dcp_metadata(tmp_path):
+    temporary_dir = tmp_path / ".merged.tmp-deadbeef"
+    output_dir = tmp_path / "merged"
+    temporary_dir.mkdir()
+    (temporary_dir / "metadata.json").write_text(
+        '{"sharded_backend": "torch_dist", "sharded_backend_version": 1, '
+        '"common_backend": "torch", "common_backend_version": 1}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WeightedMergeError, match="DCP metadata"):
+        weighted_merge_module._publish_temporary_output_dir(
+            temporary_dir, output_dir, overwrite_output=False
+        )
+
+    assert temporary_dir.exists()
+    assert not output_dir.exists()
+
+
 def test_file_backed_per_tensor_staging_uses_exact_storage(tmp_path):
     shared_store = weighted_merge_module._FileBackedTensorStore(
         tmp_path / "shared",
@@ -1084,6 +1103,23 @@ def test_direct_dcp_streaming_mode_round_trip_without_file_backed_staging(
     tmp_path_dist_ckpt, process_group, monkeypatch
 ):
     shape = (5, 2)
+    metadata_read_paths = []
+    real_reader = weighted_merge_module.FileSystemReader
+
+    class TrackingFileSystemReader:
+        def __init__(self, path, *args, **kwargs):
+            self.path = Path(path)
+            self.reader = real_reader(path, *args, **kwargs)
+
+        def read_metadata(self, *args, **kwargs):
+            metadata = self.reader.read_metadata(*args, **kwargs)
+            metadata_read_paths.append(self.path)
+            return metadata
+
+        def __getattr__(self, name):
+            return getattr(self.reader, name)
+
+    monkeypatch.setattr(weighted_merge_module, "FileSystemReader", TrackingFileSystemReader)
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_b") as ckpt_b,
@@ -1121,6 +1157,17 @@ def test_direct_dcp_streaming_mode_round_trip_without_file_backed_staging(
         assert torch.allclose(loaded["model"]["bias"], torch.full((2,), 5.0))
         assert torch.equal(loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0]))
         assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
+        prepublish_reads = [
+            path
+            for path in metadata_read_paths
+            if path.parent == output_root and path.name.startswith(".iter_0000030.tmp-")
+        ]
+        assert len(prepublish_reads) == 1
+        assert not prepublish_reads[0].exists()
+
+        postpublish_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+        assert "model.weight" in postpublish_metadata.state_dict_metadata
+        assert "model.bias" in postpublish_metadata.state_dict_metadata
 
         common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
         provenance = common_state["weighted_merge_provenance"]
