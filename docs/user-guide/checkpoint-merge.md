@@ -21,6 +21,12 @@ model's sharded state dict. It does not gather a full production model on rank
 for small conversion tests and debugging, but should not be used as the primary
 path for large model merging.
 
+The script still runs Megatron initialization to build the sharded state dict
+template, so launch it in a normal Megatron runtime with the required distributed
+and CUDA dependencies. `cpu-resident` and `file-backed-streaming` control merge
+tensor placement after template construction; they are not a CPU-only execution
+guarantee.
+
 ## Manual Weighted Merge
 
 Manual mode takes explicit `PATH:WEIGHT` inputs:
@@ -92,8 +98,9 @@ by default.
 Floating model tensors are accumulated in fp32 on CPU. `--merge-save-dtype`
 controls the saved dtype:
 
-- `same`: preserve each tensor's source dtype. All source dtypes for a tensor
-  must match.
+- `same`: preserve the dtype observed through the requested model state dict
+  template. In normal `--use-checkpoint-args` usage this should match the source
+  checkpoint dtype. All input dtypes for a tensor must match.
 - `float32`, `float16`, `bfloat16`: cast averaged tensors to the requested dtype
   before save.
 

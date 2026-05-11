@@ -1038,6 +1038,9 @@ def test_file_backed_streaming_same_dtype_matches_baseline_template_dtype(
             baseline_loaded["model"]["weight"], streaming_loaded["model"]["weight"]
         )
         assert torch.equal(baseline_loaded["model"]["bias"], streaming_loaded["model"]["bias"])
+        streaming_metadata = weighted_merge_module.load_sharded_metadata(str(streaming.output_dir))
+        assert streaming_metadata["model.weight"].dtype == torch.float32
+        assert streaming_metadata["model.bias"].dtype == torch.float32
 
 
 def test_merge_rejects_existing_output_directory_by_default(tmp_path_dist_ckpt, process_group):

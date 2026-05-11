@@ -2565,7 +2565,10 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--merge-save-dtype",
         choices=("same", "float32", "float16", "bfloat16"),
         default="same",
-        help="Saved dtype for averaged tensors. 'same' requires matching source dtypes.",
+        help=(
+            "Saved dtype for averaged tensors. 'same' preserves the loaded/template dtype "
+            "and requires compatible input dtypes."
+        ),
     )
     group.add_argument(
         "--output-iteration",
