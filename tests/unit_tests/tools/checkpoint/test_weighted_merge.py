@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import io
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -9,10 +10,14 @@ import torch.distributed as dist
 
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing import ShardedObject, ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+from megatron.core.dist_checkpointing.strategies import filesystem_async
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tools.checkpoint import weighted_merge as weighted_merge_module
 from tools.checkpoint.weighted_merge import (
     WeightedMergeError,
+    _clone_sharded_template_without_data,
     apply_hybrid_layer_pattern_compat,
     checkpoint_coefficients,
     derive_start_iteration_from_token_window,
@@ -29,6 +34,7 @@ from tools.checkpoint.weighted_merge import (
     select_checkpoints_in_window,
     validate_min_checkpoints,
     validate_weights,
+    write_latest_checkpointed_iteration,
 )
 
 
@@ -39,6 +45,17 @@ def process_group():
     yield
     if not already_initialized and dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
+
+
+@pytest.fixture(autouse=True)
+def cpu_only_dcp_save(monkeypatch):
+    if torch.cuda.is_available():
+        return
+    # DCP's mcore async writer synchronizes CUDA even for these CPU-only fixtures.
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    if not filesystem_async.HAVE_PSUTIL:
+        monkeypatch.setattr(filesystem_async, "_process_memory", lambda: 0)
 
 
 def _rank():
@@ -54,22 +71,36 @@ def _rank_offsets():
     return ((0, _rank(), world_size),) if world_size > 1 else ()
 
 
-def _template(value=0.0, *, dtype=torch.float32, extra_value=0.0, include_bias=True, shape=(2, 2)):
+def _template(
+    value=0.0,
+    *,
+    dtype=torch.float32,
+    extra_value=0.0,
+    include_bias=True,
+    shape=(2, 2),
+    device=None,
+):
     rank_offsets = _rank_offsets()
     model_state_dict = {
         "weight": ShardedTensor.from_rank_offsets(
-            "model.weight", torch.full(shape, value, dtype=dtype), *rank_offsets, replica_id=0
+            "model.weight",
+            torch.full(shape, value, dtype=dtype, device=device),
+            *rank_offsets,
+            replica_id=0,
         ),
         "decoder.layers.0._extra_state": ShardedTensor.from_rank_offsets(
             "model.decoder.layers.0._extra_state",
-            torch.tensor([extra_value], dtype=torch.float32),
+            torch.tensor([extra_value], dtype=torch.float32, device=device),
             *rank_offsets,
             replica_id=0,
         ),
     }
     if include_bias:
         model_state_dict["bias"] = ShardedTensor.from_rank_offsets(
-            "model.bias", torch.full((2,), value + 1, dtype=dtype), *rank_offsets, replica_id=0
+            "model.bias",
+            torch.full((2,), value + 1, dtype=dtype, device=device),
+            *rank_offsets,
+            replica_id=0,
         )
     return {"model": model_state_dict}
 
@@ -84,8 +115,77 @@ def _write_checkpoint(
     dist_checkpointing.save(state_dict, str(path))
 
 
-def _load_checkpoint(path, *, dtype=torch.float32):
-    return dist_checkpointing.load(_template(dtype=dtype), str(path))
+def _split_weight_factory(sharded_tensor):
+    sharded_tensor_without_data = sharded_tensor.without_data()
+    split_point = sharded_tensor.data.shape[0] // 2
+    split_sections = (split_point, sharded_tensor.data.shape[0] - split_point)
+
+    def build(key, tensor, replica_id, flattened_range):
+        base = replace(
+            sharded_tensor_without_data,
+            key=key,
+            data=tensor,
+            dtype=tensor.dtype,
+            replica_id=replica_id,
+            flattened_range=flattened_range,
+        )
+        chunks = []
+        start = 0
+        for name, length in zip(("left", "right"), split_sections):
+            chunk = base.narrow(0, start, length)[0]
+            chunk.key = f"{chunk.key}.{name}"
+            chunks.append(chunk)
+            start += length
+        return chunks
+
+    return ShardedTensorFactory(
+        sharded_tensor.key,
+        sharded_tensor.data,
+        build,
+        lambda chunks: torch.cat(chunks, dim=0),
+        sharded_tensor.replica_id,
+    )
+
+
+def _factory_template(value=0.0, *, dtype=torch.float32, shape=(4, 2)):
+    rank_offsets = _rank_offsets()
+    weight = ShardedTensor.from_rank_offsets(
+        "model.factory_weight",
+        torch.full(shape, value, dtype=dtype),
+        *rank_offsets,
+        replica_id=0,
+    )
+    return {"model": {"weight": _split_weight_factory(weight)}}
+
+
+def _write_factory_checkpoint(path, value, *, iteration=0, shape=(4, 2)):
+    state_dict = _factory_template(value, shape=shape)
+    state_dict["args"] = SimpleNamespace(iteration=iteration, hidden_size=2)
+    state_dict["checkpoint_version"] = 3.0
+    state_dict["iteration"] = iteration
+    dist_checkpointing.save(state_dict, str(path))
+
+
+def _prepended_axis_template(value=0.0, *, dtype=torch.float32, shape=(4, 2)):
+    weight = ShardedTensor.from_rank_offsets(
+        "model.prepended_weight",
+        torch.full(shape, value, dtype=dtype),
+        replica_id=0,
+        prepend_axis_num=1,
+    )
+    return {"model": {"weight": weight}}
+
+
+def _write_prepended_axis_checkpoint(path, value, *, iteration=0, shape=(4, 2)):
+    state_dict = _prepended_axis_template(value, shape=shape)
+    state_dict["args"] = SimpleNamespace(iteration=iteration, hidden_size=2)
+    state_dict["checkpoint_version"] = 3.0
+    state_dict["iteration"] = iteration
+    dist_checkpointing.save(state_dict, str(path))
+
+
+def _load_checkpoint(path, *, dtype=torch.float32, shape=(2, 2)):
+    return dist_checkpointing.load(_template(dtype=dtype, shape=shape), str(path))
 
 
 def _bytesio_state(value):
@@ -202,6 +302,83 @@ def test_parse_weighted_inputs_uses_last_colon_for_weight():
     paths, weights = parse_weighted_inputs(["/tmp/with:colon/iter_0000010:0.75"])
     assert str(paths[0]) == "/tmp/with:colon/iter_0000010"
     assert weights == [0.75]
+
+
+def test_manual_weight_policy_warnings():
+    assert weighted_merge_module._manual_weight_warnings([0.25, 0.75], normalize=False) == []
+    assert weighted_merge_module._manual_weight_warnings([2.0, -1.0], normalize=False) == [
+        "WARNING: manual merge weights include negative values; this is allowed for "
+        "subtractive merges but can produce outputs outside the input checkpoint range."
+    ]
+
+    unnormalized = weighted_merge_module._manual_weight_warnings([0.25, 0.25], normalize=False)
+    assert len(unnormalized) == 1
+    assert "sum to 0.5 without --normalize" in unnormalized[0]
+
+    normalized = weighted_merge_module._manual_weight_warnings([0.25, 0.25], normalize=True)
+    assert normalized == []
+
+
+def test_save_strategy_from_source_metadata_uses_cached_plans(monkeypatch):
+    class SourceMetadata:
+        all_local_plans = [object()]
+
+    class FakeSaveStrategy:
+        def __init__(self, *, cached_metadata=False):
+            self.cached_metadata = cached_metadata
+            self.cached_global_metadata = None
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(weighted_merge_module, "TorchDistSaveShardedStrategy", FakeSaveStrategy)
+
+    source_metadata = SourceMetadata()
+    strategy = weighted_merge_module._save_strategy_from_source_metadata(
+        source_metadata, requested=True
+    )
+
+    assert strategy.cached_metadata is True
+    assert strategy.cached_global_metadata is source_metadata
+
+
+def test_save_strategy_from_source_metadata_falls_back_without_cuda(monkeypatch):
+    class SourceMetadata:
+        all_local_plans = [object()]
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    assert (
+        weighted_merge_module._save_strategy_from_source_metadata(
+            SourceMetadata(), requested=True
+        )
+        is None
+    )
+
+
+def test_file_backed_per_tensor_staging_uses_exact_storage(tmp_path):
+    shared_store = weighted_merge_module._FileBackedTensorStore(
+        tmp_path / "shared",
+        rank=0,
+        dtype_numels={torch.float32: 6},
+        layout="shared-dtype",
+    )
+    shared_first = shared_store.allocate((2,), torch.float32, "first")
+    shared_store.allocate((4,), torch.float32, "second")
+
+    per_tensor_store = weighted_merge_module._FileBackedTensorStore(
+        tmp_path / "per_tensor",
+        rank=0,
+        dtype_numels={torch.float32: 6},
+        layout="per-tensor",
+    )
+    per_tensor_first = per_tensor_store.allocate((2,), torch.float32, "first")
+    per_tensor_store.allocate((4,), torch.float32, "second")
+
+    assert shared_first.untyped_storage().size() != shared_first.numel() * shared_first.itemsize
+    assert per_tensor_first.untyped_storage().size() == (
+        per_tensor_first.numel() * per_tensor_first.itemsize
+    )
+    assert shared_store.file_count == 1
+    assert per_tensor_store.file_count == 2
 
 
 def test_legacy_hybrid_override_pattern_is_used_for_hybrid_builder():
@@ -346,6 +523,18 @@ def test_merge_sharded_checkpoints_round_trip(tmp_path_dist_ckpt, process_group)
         assert result.output_dir == output_root / "iter_0000030"
         assert result.verified_load
         assert result.timings.verification >= 0.0
+        assert result.memory_estimate.mergeable_tensors == 2
+        assert result.memory_estimate.extra_state_entries == 1
+        assert result.memory_estimate.loaded_checkpoint_bytes == 24
+        assert result.memory_estimate.accumulator_bytes == 24
+        assert result.memory_estimate.output_tensor_bytes == 24
+        assert result.memory_estimate.projected_cpu_peak_bytes == 52
+        assert result.memory_estimate.projected_gpu_peak_bytes == 0
+        assert result.memory_estimate.file_backed_staging_bytes == 0
+        assert result.memory_estimate.file_backed_staging_files == 0
+        assert result.max_host_peak_bytes >= result.host_peak_bytes
+        assert result.max_gpu_peak_bytes >= result.gpu_peak_bytes
+        assert result.world_size >= 1
         assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
 
         loaded = _load_checkpoint(result.output_dir)
@@ -356,6 +545,116 @@ def test_merge_sharded_checkpoints_round_trip(tmp_path_dist_ckpt, process_group)
         assert loaded["iteration"] == 30
         assert loaded["args"].iteration == 30
         assert loaded["args"].hidden_size == 2
+        common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
+        provenance = common_state["weighted_merge_provenance"]
+        assert provenance["weights"] == [0.25, 0.75]
+        assert provenance["implementation_mode"] == "baseline"
+        assert provenance["extra_state_source_index"] == 0
+        assert provenance["optimizer_merged"] is False
+        assert provenance["rng_merged"] is False
+
+
+def test_projected_cpu_memory_guard_fails_before_loading(tmp_path_dist_ckpt, process_group):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_guard_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_guard_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_guard_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=10)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=20)
+
+        with pytest.raises(WeightedMergeError, match="Projected CPU peak memory"):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.5, 0.5],
+                output_root / "merged",
+                lambda: _template(),
+                max_projected_cpu_bytes=51,
+            )
+
+        assert not (output_root / "merged").exists()
+
+
+def test_file_backed_staging_guard_fails_before_staging(tmp_path_dist_ckpt, process_group):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_staging_guard_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_staging_guard_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_staging_guard_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=10)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=20)
+
+        with pytest.raises(WeightedMergeError, match="file-backed staging storage"):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.5, 0.5],
+                output_root / "merged",
+                lambda: _template(),
+                execution_mode="file-backed-streaming",
+                max_file_backed_staging_bytes=23,
+            )
+
+        assert not (output_root / "merged").exists()
+        assert not (output_root / ".merged.staging").exists()
+
+
+def test_file_backed_staging_file_guard_fails_before_staging(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_staging_file_guard_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_staging_file_guard_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_staging_file_guard_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=10)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=20)
+
+        with pytest.raises(WeightedMergeError, match="staging file count"):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.5, 0.5],
+                output_root / "merged",
+                lambda: _template(),
+                execution_mode="file-backed-streaming",
+                file_backed_staging_layout="per-tensor",
+                max_file_backed_staging_files=1,
+            )
+
+        assert not (output_root / "merged").exists()
+        assert not (output_root / ".merged.staging").exists()
+
+
+def test_file_backed_streaming_preflight_only_writes_nothing(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_preflight_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_preflight_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_preflight_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=10)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=20)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.5, 0.5],
+            output_root / "merged",
+            lambda: _template(),
+            execution_mode="file-backed-streaming",
+            preflight_only=True,
+        )
+
+        assert result.preflight_only is True
+        assert result.output_dir == output_root / "merged"
+        assert result.bytes_read == 0
+        assert result.bytes_written == 0
+        assert result.timings.load == 0.0
+        assert result.timings.save == 0.0
+        assert result.memory_estimate.file_backed_staging_bytes == 24
+        assert result.memory_estimate.file_backed_staging_files == 1
+        assert not (output_root / "merged").exists()
+        assert not (output_root / ".merged.staging").exists()
+        assert not list(output_root.glob(".merged.tmp-*"))
 
 
 def test_merge_without_output_iteration_preserves_common_metadata(
@@ -370,15 +669,421 @@ def test_merge_without_output_iteration_preserves_common_metadata(
         _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=20)
 
         result = merge_sharded_checkpoints(
-            [ckpt_a, ckpt_b], [0.5, 0.5], output_root, lambda: _template()
+            [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged", lambda: _template()
         )
         loaded = _load_checkpoint(result.output_dir)
 
-        assert result.output_dir == output_root
+        assert result.output_dir == output_root / "merged"
         assert not (output_root / "latest_checkpointed_iteration.txt").exists()
         assert loaded["iteration"] == 10
         assert loaded["args"].iteration == 10
         assert loaded["args"].hidden_size == 2
+
+
+def test_cpu_resident_mode_uses_cpu_buffers_for_meta_template(tmp_path_dist_ckpt, process_group):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cpu_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cpu_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cpu_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1)
+        _write_checkpoint(ckpt_b, 3.0, extra_value=999.0, iteration=2)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.5, 0.5],
+            output_root / "merged",
+            lambda: _template(device="meta"),
+            execution_mode="cpu-resident",
+            verify_load=True,
+        )
+
+        loaded = _load_checkpoint(result.output_dir)
+        assert result.implementation_mode == "cpu-resident"
+        assert result.verified_load
+        assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 2.0))
+        assert torch.equal(loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0]))
+
+
+def test_file_backed_streaming_mode_round_trip(tmp_path_dist_ckpt, process_group):
+    shape = (5, 2)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1, shape=shape)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=2, shape=shape)
+        staging_root = output_root / "staging"
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _template(shape=shape),
+            execution_mode="file-backed-streaming",
+            streaming_chunk_bytes=16,
+            staging_dir=staging_root,
+            verify_load=True,
+        )
+
+        loaded = _load_checkpoint(result.output_dir, shape=shape)
+        assert result.implementation_mode == "file-backed-streaming"
+        assert result.verified_load
+        assert result.memory_estimate.projected_gpu_peak_bytes == 0
+        assert result.memory_estimate.file_backed_staging_bytes == (
+            result.memory_estimate.output_tensor_bytes
+        )
+        assert result.memory_estimate.file_backed_staging_files == 1
+        assert result.memory_estimate.projected_cpu_peak_bytes < (
+            result.memory_estimate.accumulator_bytes
+            + result.memory_estimate.loaded_checkpoint_bytes
+            + result.memory_estimate.extra_state_tensor_bytes
+        )
+        assert torch.allclose(loaded["model"]["weight"], torch.full(shape, 4.0))
+        assert torch.allclose(loaded["model"]["bias"], torch.full((2,), 5.0))
+        assert torch.equal(loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0]))
+        staged_files = list(staging_root.glob("rank*-*.bin"))
+        assert len(staged_files) == 1
+        assert staged_files[0].name.endswith("float32.bin")
+        common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
+        assert common_state["weighted_merge_provenance"]["implementation_mode"] == (
+            "file-backed-streaming"
+        )
+
+
+def test_file_backed_streaming_metadata_cache_request_falls_back_when_strategy_unavailable(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    shape = (5, 2)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_cache_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_cache_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_cache_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1, shape=shape)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=2, shape=shape)
+
+        monkeypatch.setattr(
+            weighted_merge_module,
+            "_save_strategy_from_source_metadata",
+            lambda source_metadata, *, requested: None,
+        )
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _template(shape=shape),
+            execution_mode="file-backed-streaming",
+            streaming_chunk_bytes=16,
+            reuse_source_metadata_for_save=True,
+            verify_load=True,
+        )
+
+        loaded = _load_checkpoint(result.output_dir, shape=shape)
+        assert result.save_metadata_cache_requested is True
+        assert result.save_metadata_cache_reused is False
+        assert torch.allclose(loaded["model"]["weight"], torch.full(shape, 4.0))
+
+
+def test_file_backed_streaming_per_tensor_staging_round_trip(
+    tmp_path_dist_ckpt, process_group
+):
+    shape = (5, 2)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_per_tensor_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_per_tensor_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_per_tensor_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1, shape=shape)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=2, shape=shape)
+        staging_root = output_root / "staging"
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _template(shape=shape),
+            execution_mode="file-backed-streaming",
+            streaming_chunk_bytes=16,
+            staging_dir=staging_root,
+            file_backed_staging_layout="per-tensor",
+            verify_load=True,
+        )
+
+        loaded = _load_checkpoint(result.output_dir, shape=shape)
+        staged_files = list(staging_root.glob("rank*-*.bin"))
+        assert result.file_backed_staging_layout == "per-tensor"
+        assert result.memory_estimate.file_backed_staging_files == 2
+        assert len(staged_files) == 2
+        assert torch.allclose(loaded["model"]["weight"], torch.full(shape, 4.0))
+        assert torch.allclose(loaded["model"]["bias"], torch.full((2,), 5.0))
+
+
+def test_file_backed_streaming_metadata_cache_falls_back_without_cached_plans(
+    tmp_path_dist_ckpt, process_group
+):
+    shape = (5, 2)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_reuse_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_reuse_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_reuse_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1, shape=shape)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=2, shape=shape)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _template(shape=shape),
+            execution_mode="file-backed-streaming",
+            streaming_chunk_bytes=16,
+            reuse_source_metadata_for_save=True,
+            verify_load=True,
+        )
+
+        loaded = _load_checkpoint(result.output_dir, shape=shape)
+        assert result.save_metadata_cache_requested is True
+        assert result.save_metadata_cache_reused is False
+        assert torch.allclose(loaded["model"]["weight"], torch.full(shape, 4.0))
+
+
+def test_source_metadata_save_reuse_requires_file_backed_same_dtype(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cache_guard_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cache_guard_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+
+        with pytest.raises(WeightedMergeError, match="file-backed-streaming"):
+            merge_sharded_checkpoints(
+                [ckpt_a],
+                [1.0],
+                output_root / "baseline",
+                lambda: _template(),
+                reuse_source_metadata_for_save=True,
+            )
+
+        with pytest.raises(WeightedMergeError, match="merge-save-dtype=same"):
+            merge_sharded_checkpoints(
+                [ckpt_a],
+                [1.0],
+                output_root / "streaming",
+                lambda: _template(),
+                execution_mode="file-backed-streaming",
+                save_dtype="float32",
+                reuse_source_metadata_for_save=True,
+            )
+
+
+def test_file_backed_streaming_loads_before_all_outputs_are_staged(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    shape = (5, 2)
+    allocations = []
+    first_load = {}
+    real_allocate = weighted_merge_module._FileBackedTensorStore.allocate
+    real_load = weighted_merge_module._load_tensor_path_group_fast
+
+    def tracking_allocate(self, shape, dtype, label=None):
+        allocations.append(tuple(int(dim) for dim in shape))
+        return real_allocate(self, shape, dtype, label)
+
+    def tracking_load(checkpoint_dir, path_leaves, sharded_strategy):
+        first_load.setdefault("allocation_count", len(allocations))
+        first_load.setdefault("path_count", len(path_leaves))
+        return real_load(checkpoint_dir, path_leaves, sharded_strategy)
+
+    monkeypatch.setattr(
+        weighted_merge_module._FileBackedTensorStore,
+        "allocate",
+        tracking_allocate,
+    )
+    monkeypatch.setattr(
+        weighted_merge_module,
+        "_load_tensor_path_group_fast",
+        tracking_load,
+    )
+
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_lazy_stream_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_lazy_stream_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_lazy_stream_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1, shape=shape)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=2, shape=shape)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _template(shape=shape),
+            execution_mode="file-backed-streaming",
+            streaming_chunk_bytes=16,
+            staging_dir=output_root / "staging",
+            verify_load=True,
+        )
+
+        loaded = _load_checkpoint(result.output_dir, shape=shape)
+        assert first_load["allocation_count"] == 1
+        assert first_load["path_count"] == 1
+        assert len(allocations) == 2
+        assert torch.allclose(loaded["model"]["weight"], torch.full(shape, 4.0))
+        assert torch.allclose(loaded["model"]["bias"], torch.full((2,), 5.0))
+
+
+def test_streaming_output_template_clone_drops_tensor_buffers(process_group):
+    template = _template(shape=(4, 2))
+    factory_template = _factory_template(shape=(4, 2))
+    cloned = _clone_sharded_template_without_data(
+        {"plain": template["model"]["weight"], "factory": factory_template["model"]["weight"]}
+    )
+
+    assert template["model"]["weight"].data is not None
+    assert factory_template["model"]["weight"].data is not None
+    assert cloned["plain"].data is None
+    assert cloned["factory"].data is None
+    assert cloned["plain"].key == template["model"]["weight"].key
+    assert cloned["factory"].key == factory_template["model"]["weight"].key
+
+
+def test_file_backed_streaming_supports_sharded_tensor_factory(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_factory_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_factory_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_factory_out") as output_root,
+    ):
+        _write_factory_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_factory_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _factory_template(),
+            execution_mode="file-backed-streaming",
+            streaming_chunk_bytes=16,
+            verify_load=True,
+        )
+
+        loaded = dist_checkpointing.load(_factory_template(), str(result.output_dir))
+        assert result.implementation_mode == "file-backed-streaming"
+        assert result.verified_load
+        assert torch.allclose(loaded["model"]["weight"], torch.full((4, 2), 4.0))
+
+
+def test_file_backed_streaming_supports_prepended_axis_tensors(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_prepend_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_prepend_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_prepend_out") as output_root,
+    ):
+        _write_prepended_axis_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_prepended_axis_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _prepended_axis_template(),
+            execution_mode="file-backed-streaming",
+            streaming_chunk_bytes=16,
+            verify_load=True,
+        )
+
+        loaded = dist_checkpointing.load(_prepended_axis_template(), str(result.output_dir))
+        assert result.implementation_mode == "file-backed-streaming"
+        assert result.verified_load
+        assert torch.allclose(loaded["model"]["weight"], torch.full((4, 2), 4.0))
+
+
+def test_file_backed_streaming_same_dtype_matches_baseline_template_dtype(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_same_dtype_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_same_dtype_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_same_dtype_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, dtype=torch.bfloat16, iteration=1)
+        _write_checkpoint(ckpt_b, 1.0078125, dtype=torch.bfloat16, iteration=2)
+
+        baseline = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.5, 0.5],
+            output_root / "baseline",
+            lambda: _template(dtype=torch.float32),
+            save_dtype="same",
+        )
+        streaming = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.5, 0.5],
+            output_root / "streaming",
+            lambda: _template(dtype=torch.float32),
+            save_dtype="same",
+            execution_mode="file-backed-streaming",
+            streaming_chunk_bytes=16,
+        )
+
+        baseline_loaded = _load_checkpoint(baseline.output_dir, dtype=torch.float32)
+        streaming_loaded = _load_checkpoint(streaming.output_dir, dtype=torch.float32)
+        assert torch.equal(
+            baseline_loaded["model"]["weight"], streaming_loaded["model"]["weight"]
+        )
+        assert torch.equal(baseline_loaded["model"]["bias"], streaming_loaded["model"]["bias"])
+
+
+def test_merge_rejects_existing_output_directory_by_default(tmp_path_dist_ckpt, process_group):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_exists_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_exists_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        output_dir = output_root / "merged"
+        output_dir.mkdir()
+
+        with pytest.raises(WeightedMergeError, match="Output directory already exists"):
+            merge_sharded_checkpoints([ckpt_a], [1.0], output_dir, lambda: _template())
+
+
+def test_byte_accounting_none_skips_recursive_directory_size(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_no_bytes_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_no_bytes_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+
+        def fail_directory_size(_path):
+            raise AssertionError("directory size should not be measured")
+
+        monkeypatch.setattr("tools.checkpoint.weighted_merge._directory_size", fail_directory_size)
+        result = merge_sharded_checkpoints(
+            [ckpt_a],
+            [1.0],
+            output_root / "merged",
+            lambda: _template(),
+            byte_accounting="none",
+        )
+
+        assert result.bytes_read == 0
+        assert result.bytes_written == 0
+
+
+def test_latest_marker_requires_checkpoint_metadata(tmp_path):
+    checkpoint_dir = tmp_path / "iter_0000001"
+    checkpoint_dir.mkdir()
+
+    with pytest.raises(WeightedMergeError, match="metadata"):
+        write_latest_checkpointed_iteration(checkpoint_dir, 1)
 
 
 def test_merge_sharded_checkpoints_supports_multiple_model_chunks(
@@ -393,7 +1098,10 @@ def test_merge_sharded_checkpoints_supports_multiple_model_chunks(
         _write_multi_chunk_checkpoint(ckpt_b, 5.0, iteration=2)
 
         result = merge_sharded_checkpoints(
-            [ckpt_a, ckpt_b], [0.25, 0.75], output_root, lambda: _multi_chunk_template()
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _multi_chunk_template(),
         )
         loaded = dist_checkpointing.load(_multi_chunk_template(), str(result.output_dir))
 
@@ -469,7 +1177,7 @@ def test_merge_accumulates_fp16_inputs_in_fp32(tmp_path_dist_ckpt, process_group
         result = merge_sharded_checkpoints(
             [ckpt_a, ckpt_b],
             [0.5, 0.5],
-            output_root,
+            output_root / "merged",
             lambda: _template(dtype=torch.float16),
             save_dtype="float32",
         )
@@ -492,7 +1200,7 @@ def test_merge_rejects_dtype_mismatch_with_same_policy(tmp_path_dist_ckpt, proce
             merge_sharded_checkpoints(
                 [ckpt_a, ckpt_b],
                 [0.5, 0.5],
-                output_root,
+                output_root / "merged",
                 lambda: _template(dtype=torch.float32),
                 save_dtype="same",
             )
@@ -509,7 +1217,10 @@ def test_merge_rejects_non_floating_tensors(tmp_path_dist_ckpt, process_group):
 
         with pytest.raises(WeightedMergeError, match="non-floating"):
             merge_sharded_checkpoints(
-                [ckpt_a, ckpt_b], [0.5, 0.5], output_root, lambda: _template(dtype=torch.int64)
+                [ckpt_a, ckpt_b],
+                [0.5, 0.5],
+                output_root / "merged",
+                lambda: _template(dtype=torch.int64),
             )
 
 
@@ -524,8 +1235,37 @@ def test_merge_rejects_shape_mismatch(tmp_path_dist_ckpt, process_group):
 
         with pytest.raises(Exception, match="Shape mismatch|shape|model.weight"):
             merge_sharded_checkpoints(
-                [ckpt_a, ckpt_b], [0.5, 0.5], output_root, lambda: _template(shape=(2, 2))
+                [ckpt_a, ckpt_b],
+                [0.5, 0.5],
+                output_root / "merged",
+                lambda: _template(shape=(2, 2)),
             )
+
+
+def test_file_backed_streaming_rejects_template_shape_mismatch(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_shape_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_shape_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_shape_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, shape=(3, 2), iteration=1)
+        _write_checkpoint(ckpt_b, 2.0, shape=(3, 2), iteration=2)
+
+        with pytest.raises(
+            WeightedMergeError, match="template expects global shape|Shape mismatch"
+        ):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.5, 0.5],
+                output_root / "merged",
+                lambda: _template(shape=(2, 2)),
+                execution_mode="file-backed-streaming",
+                streaming_chunk_bytes=16,
+            )
+
+        assert not (output_root / "merged").exists()
 
 
 def test_merge_rejects_incompatible_checkpoint_keys(tmp_path_dist_ckpt, process_group):
@@ -543,7 +1283,7 @@ def test_merge_rejects_incompatible_checkpoint_keys(tmp_path_dist_ckpt, process_
 
         with pytest.raises(Exception, match="model.bias|Missing|missing|Unexpected|unexpected"):
             merge_sharded_checkpoints(
-                [ckpt_a, ckpt_b], [0.5, 0.5], output_root, lambda: _template()
+                [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged", lambda: _template()
             )
 
 
@@ -564,7 +1304,7 @@ def test_merge_allows_extra_checkpoint_keys_by_default(tmp_path_dist_ckpt, proce
         dist_checkpointing.save(state_dict, str(ckpt_b))
 
         result = merge_sharded_checkpoints(
-            [ckpt_a, ckpt_b], [0.5, 0.5], output_root, lambda: _template()
+            [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged", lambda: _template()
         )
         loaded = _load_checkpoint(result.output_dir)
 
@@ -591,10 +1331,68 @@ def test_merge_rejects_extra_checkpoint_keys_with_raise_all(tmp_path_dist_ckpt, 
             merge_sharded_checkpoints(
                 [ckpt_a, ckpt_b],
                 [0.5, 0.5],
-                output_root,
+                output_root / "merged",
                 lambda: _template(),
                 strict=StrictHandling.RAISE_ALL,
             )
+
+
+def test_file_backed_streaming_rejects_extra_checkpoint_keys_with_raise_all(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_extra_strict_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_extra_strict_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_extra_strict_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        state_dict = _template(2.0)
+        state_dict["model"]["extra"] = ShardedTensor.from_rank_offsets(
+            "model.extra", torch.ones((2,), dtype=torch.float32), *_rank_offsets(), replica_id=0
+        )
+        state_dict["args"] = SimpleNamespace(iteration=2)
+        state_dict["checkpoint_version"] = 3.0
+        state_dict["iteration"] = 2
+        dist_checkpointing.save(state_dict, str(ckpt_b))
+
+        with pytest.raises(Exception, match="model.extra|missing|strict validation"):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.5, 0.5],
+                output_root / "merged",
+                lambda: _template(),
+                execution_mode="file-backed-streaming",
+                strict=StrictHandling.RAISE_ALL,
+            )
+
+        assert not (output_root / "merged").exists()
+
+
+def test_file_backed_streaming_raise_all_accepts_matching_checkpoint_keys(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_raise_all_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_raise_all_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_stream_raise_all_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 2.0, iteration=2)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.5, 0.5],
+            output_root / "merged",
+            lambda: _template(),
+            execution_mode="file-backed-streaming",
+            strict=StrictHandling.RAISE_ALL,
+            verify_load=True,
+        )
+        loaded = _load_checkpoint(result.output_dir)
+
+        assert result.implementation_mode == "file-backed-streaming"
+        assert result.verified_load
+        assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 1.5))
 
 
 def test_merge_rejects_missing_metadata(tmp_path_dist_ckpt, process_group):
@@ -609,7 +1407,7 @@ def test_merge_rejects_missing_metadata(tmp_path_dist_ckpt, process_group):
 
         with pytest.raises(WeightedMergeError, match="not a distributed checkpoint|metadata"):
             merge_sharded_checkpoints(
-                [ckpt_a, ckpt_b], [0.5, 0.5], output_root, lambda: _template()
+                [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged", lambda: _template()
             )
 
 
@@ -629,7 +1427,7 @@ def test_merge_rejects_checkpoint_format_mismatch(tmp_path_dist_ckpt, process_gr
 
         with pytest.raises(WeightedMergeError, match="Checkpoint format mismatch"):
             merge_sharded_checkpoints(
-                [ckpt_a, ckpt_b], [0.5, 0.5], output_root, lambda: _template()
+                [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged", lambda: _template()
             )
 
 
@@ -646,7 +1444,9 @@ def test_merge_rejects_unsupported_checkpoint_format(tmp_path_dist_ckpt, process
         )
 
         with pytest.raises(WeightedMergeError, match="Unsupported checkpoint format"):
-            merge_sharded_checkpoints([ckpt_a], [1.0], output_root, lambda: _template())
+            merge_sharded_checkpoints(
+                [ckpt_a], [1.0], output_root / "merged", lambda: _template()
+            )
 
 
 def test_merge_rejects_argument_validation_errors(tmp_path_dist_ckpt, process_group):
@@ -664,6 +1464,39 @@ def test_merge_rejects_argument_validation_errors(tmp_path_dist_ckpt, process_gr
             merge_sharded_checkpoints(
                 [ckpt_a], [1.0], output_root, lambda: _template(), save_dtype="fp8"
             )
+        with pytest.raises(WeightedMergeError, match="Unsupported file-backed staging layout"):
+            merge_sharded_checkpoints(
+                [ckpt_a],
+                [1.0],
+                output_root,
+                lambda: _template(),
+                file_backed_staging_layout="one-giant-view",
+            )
+        with pytest.raises(WeightedMergeError, match="max_file_backed_staging_bytes"):
+            merge_sharded_checkpoints(
+                [ckpt_a],
+                [1.0],
+                output_root,
+                lambda: _template(),
+                max_file_backed_staging_bytes=0,
+            )
+        with pytest.raises(WeightedMergeError, match="max_file_backed_staging_files"):
+            merge_sharded_checkpoints(
+                [ckpt_a],
+                [1.0],
+                output_root,
+                lambda: _template(),
+                max_file_backed_staging_files=0,
+            )
+        with pytest.raises(WeightedMergeError, match="preflight_only"):
+            merge_sharded_checkpoints(
+                [ckpt_a],
+                [1.0],
+                output_root,
+                lambda: _template(),
+                preflight_only=True,
+                verify_load=True,
+            )
 
 
 def test_merge_rejects_return_style_strict_modes(tmp_path_dist_ckpt, process_group):
@@ -679,7 +1512,7 @@ def test_merge_rejects_return_style_strict_modes(tmp_path_dist_ckpt, process_gro
             merge_sharded_checkpoints(
                 [ckpt_a, ckpt_b],
                 [0.5, 0.5],
-                output_root,
+                output_root / "merged",
                 lambda: _template(),
                 strict=StrictHandling.RETURN_ALL,
             )
@@ -695,7 +1528,10 @@ def test_object_extra_state_is_copied(tmp_path_dist_ckpt, process_group):
         _write_object_extra_checkpoint(ckpt_b, 3.0, extra_value=999, iteration=2)
 
         result = merge_sharded_checkpoints(
-            [ckpt_a, ckpt_b], [0.5, 0.5], output_root, lambda: _object_extra_template()
+            [ckpt_a, ckpt_b],
+            [0.5, 0.5],
+            output_root / "merged",
+            lambda: _object_extra_template(),
         )
         loaded = dist_checkpointing.load(_object_extra_template(), str(result.output_dir))
 
@@ -716,7 +1552,7 @@ def test_extra_state_source_index_can_be_selected(tmp_path_dist_ckpt, process_gr
         result = merge_sharded_checkpoints(
             [ckpt_a, ckpt_b],
             [0.5, 0.5],
-            output_root,
+            output_root / "merged",
             lambda: _template(),
             extra_state_source_index=1,
         )
