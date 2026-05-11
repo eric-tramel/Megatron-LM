@@ -1204,6 +1204,29 @@ def _publish_temporary_output_dir(
     _run_rank0_filesystem_op(f"Publishing merged checkpoint to {output_dir}", publish)
 
 
+def _verify_checkpoint_load(
+    *,
+    checkpoint_dir: Path,
+    sharded_state_dict_factory: Callable[[], ShardedStateDict],
+    execution_mode: str,
+    validate_access_integrity: bool,
+    strict: StrictHandling,
+) -> float:
+    verify_start = time.perf_counter()
+    verification_state_dict = _state_dict_for_execution_mode(
+        sharded_state_dict_factory, execution_mode
+    )
+    dist_checkpointing.load(
+        verification_state_dict,
+        str(checkpoint_dir),
+        validate_access_integrity=validate_access_integrity,
+        strict=strict,
+    )
+    if dist.is_initialized():
+        dist.barrier()
+    return time.perf_counter() - verify_start
+
+
 def _classify_template(
     sharded_state_dict: ShardedStateDict,
 ) -> tuple[list[tuple[Union[str, int], ...]], list[tuple[Union[str, int], ...]]]:
@@ -3567,6 +3590,16 @@ def merge_sharded_checkpoints(
         for key, value in common_state.items():
             merged_state_dict[key] = value
 
+    verification_time = 0.0
+    if direct_dcp_save_completed and verify_load:
+        verification_time = _verify_checkpoint_load(
+            checkpoint_dir=temporary_output_dir,
+            sharded_state_dict_factory=sharded_state_dict_factory,
+            execution_mode=execution_mode,
+            validate_access_integrity=validate_access_integrity,
+            strict=strict,
+        )
+
     save_start = time.perf_counter()
     save_metadata_cache_reused = False
     if not direct_dcp_save_completed:
@@ -3610,21 +3643,14 @@ def merge_sharded_checkpoints(
         save_time += direct_dcp_save_time
     bytes_written = _directory_size_for_accounting(output_dir, byte_accounting)
 
-    verification_time = 0.0
-    if verify_load:
-        verify_start = time.perf_counter()
-        verification_state_dict = _state_dict_for_execution_mode(
-            sharded_state_dict_factory, execution_mode
-        )
-        dist_checkpointing.load(
-            verification_state_dict,
-            str(output_dir),
+    if verify_load and not direct_dcp_save_completed:
+        verification_time = _verify_checkpoint_load(
+            checkpoint_dir=output_dir,
+            sharded_state_dict_factory=sharded_state_dict_factory,
+            execution_mode=execution_mode,
             validate_access_integrity=validate_access_integrity,
             strict=strict,
         )
-        if dist.is_initialized():
-            dist.barrier()
-        verification_time = time.perf_counter() - verify_start
 
     if execution_mode == "file-backed-streaming" and staging_dir is None:
         _run_rank0_filesystem_op(

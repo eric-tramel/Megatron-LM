@@ -1461,6 +1461,104 @@ def test_direct_dcp_streaming_bfloat16_save_dtype_and_chunk_metadata(
         assert all(chunk.sizes.numel() < torch.Size(shape).numel() for chunk in weight_metadata.chunks)
 
 
+def test_direct_dcp_streaming_verify_load_checks_hidden_temp_before_publication(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_verify_temp_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_verify_temp_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_verify_temp_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2)
+        final_dir = output_root / "iter_0000030"
+        marker = output_root / "latest_checkpointed_iteration.txt"
+        verify_calls = []
+        real_load = weighted_merge_module.dist_checkpointing.load
+
+        def tracking_load(state_dict, checkpoint_dir, *args, **kwargs):
+            checkpoint_path = Path(checkpoint_dir)
+            if checkpoint_path.parent == output_root and checkpoint_path.name.startswith(
+                ".iter_0000030.tmp-"
+            ):
+                verify_calls.append(
+                    {
+                        "path": checkpoint_path,
+                        "final_exists": final_dir.exists(),
+                        "marker_exists": marker.exists(),
+                    }
+                )
+            return real_load(state_dict, checkpoint_dir, *args, **kwargs)
+
+        monkeypatch.setattr(weighted_merge_module.dist_checkpointing, "load", tracking_load)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            lambda: _template(),
+            output_iteration=30,
+            execution_mode="direct-dcp-streaming",
+            streaming_chunk_bytes=16,
+            verify_load=True,
+        )
+
+        assert result.output_dir == final_dir
+        assert result.verified_load
+        assert verify_calls
+        assert len({call["path"] for call in verify_calls}) == 1
+        verify_call = verify_calls[0]
+        assert verify_call["path"].parent == output_root
+        assert verify_call["path"].name.startswith(".iter_0000030.tmp-")
+        assert all(not call["final_exists"] for call in verify_calls)
+        assert all(not call["marker_exists"] for call in verify_calls)
+        assert not verify_call["path"].exists()
+        assert final_dir.exists()
+        assert marker.read_text(encoding="utf-8").strip() == "30"
+
+
+def test_direct_dcp_streaming_verify_load_failure_blocks_publication(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    real_load = weighted_merge_module.dist_checkpointing.load
+    verify_paths = []
+
+    def fail_hidden_temp_load(state_dict, checkpoint_dir, *args, **kwargs):
+        checkpoint_path = Path(checkpoint_dir)
+        if checkpoint_path.name.startswith(".iter_0000030.tmp-"):
+            verify_paths.append(checkpoint_path)
+            raise RuntimeError("injected hidden temp verify failure")
+        return real_load(state_dict, checkpoint_dir, *args, **kwargs)
+
+    monkeypatch.setattr(weighted_merge_module.dist_checkpointing, "load", fail_hidden_temp_load)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_verify_fail_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_verify_fail_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_verify_fail_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        with pytest.raises(RuntimeError, match="injected hidden temp verify failure"):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                lambda: _template(),
+                output_iteration=30,
+                execution_mode="direct-dcp-streaming",
+                streaming_chunk_bytes=16,
+                verify_load=True,
+            )
+
+        assert len(verify_paths) == 1
+        _assert_no_direct_atomic_publication(output_root, 30)
+        assert verify_paths[0].exists()
+        torch_dcp.FileSystemReader(verify_paths[0]).read_metadata()
+        assert (verify_paths[0] / "metadata.json").exists()
+        assert (verify_paths[0] / "common.pt").exists()
+
+
 def test_metadata_same_layout_merge_round_trip_without_model_builder_path(
     tmp_path_dist_ckpt, process_group, monkeypatch
 ):
@@ -2334,13 +2432,25 @@ def test_direct_dcp_streaming_latest_marker_failure_is_after_publication(
     tmp_path_dist_ckpt, process_group, monkeypatch
 ):
     real_replace = weighted_merge_module.os.replace
+    real_load = weighted_merge_module.dist_checkpointing.load
+    verify_paths = []
 
     def fail_latest_marker_replace(src, dst):
         if Path(dst).name == "latest_checkpointed_iteration.txt":
+            assert verify_paths
             raise OSError("injected latest marker failure")
         real_replace(src, dst)
 
+    def tracking_load(state_dict, checkpoint_dir, *args, **kwargs):
+        checkpoint_path = Path(checkpoint_dir)
+        if checkpoint_path.parent == output_root and checkpoint_path.name.startswith(
+            ".iter_0000030.tmp-"
+        ):
+            verify_paths.append(checkpoint_path)
+        return real_load(state_dict, checkpoint_dir, *args, **kwargs)
+
     monkeypatch.setattr(weighted_merge_module.os, "replace", fail_latest_marker_replace)
+    monkeypatch.setattr(weighted_merge_module.dist_checkpointing, "load", tracking_load)
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_marker_fail_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_marker_fail_b") as ckpt_b,
@@ -2358,9 +2468,15 @@ def test_direct_dcp_streaming_latest_marker_failure_is_after_publication(
                 output_iteration=30,
                 execution_mode="direct-dcp-streaming",
                 streaming_chunk_bytes=16,
+                verify_load=True,
             )
 
         final_dir = output_root / "iter_0000030"
+        assert verify_paths
+        assert len(set(verify_paths)) == 1
+        assert verify_paths[0].parent == output_root
+        assert verify_paths[0].name.startswith(".iter_0000030.tmp-")
+        assert not verify_paths[0].exists()
         assert final_dir.exists()
         torch_dcp.FileSystemReader(final_dir).read_metadata()
         assert not (output_root / "latest_checkpointed_iteration.txt").exists()
