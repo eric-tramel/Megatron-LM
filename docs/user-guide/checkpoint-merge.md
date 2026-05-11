@@ -144,15 +144,16 @@ building a performance table for a PR.
 
 `--merge-execution-mode=direct-dcp-streaming` is an experimental, guarded
 single-rank `torch_dist` prototype. It streams fp32-accumulated output chunks
-directly into PyTorch DCP storage and publishes DCP metadata for those chunks,
-avoiding the file-backed full-output staging tensor used by
+through a tool-local public PyTorch DCP `SavePlanner` and public
+`FileSystemWriter`, avoiding the file-backed full-output staging tensor used by
 `file-backed-streaming` in local tests.
 
-Use this mode only as an opt-in experiment. It currently requires private
-PyTorch DCP filesystem APIs and rejects merge-time world sizes greater than one.
-It supports ordinary `ShardedTensor` leaves in the tested local fixtures, copies
-tensor `_extra_state` entries from the selected source checkpoint, and can be
-validated with `--verify-load`.
+Use this mode only as an opt-in experiment. It no longer constructs private DCP
+output storage records or manually writes DCP metadata/payloads, but it still
+rejects merge-time world sizes greater than one. It supports ordinary
+`ShardedTensor` leaves in the tested local fixtures, copies tensor
+`_extra_state` entries from the selected source checkpoint, and can be validated
+with `--verify-load`.
 
 This mode is output-bounded only for ordinary one-payload source checkpoints.
 Local source-read instrumentation showed that a 1 MiB logical request against a

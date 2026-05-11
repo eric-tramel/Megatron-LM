@@ -13,7 +13,6 @@ import argparse
 import copy
 import math
 import os
-import pickle
 import random
 import re
 import resource
@@ -34,6 +33,21 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as torch_dcp
+from torch.distributed.checkpoint import FileSystemWriter
+from torch.distributed.checkpoint.default_planner import create_default_global_save_plan
+from torch.distributed.checkpoint.metadata import (
+    ChunkStorageMetadata,
+    MetadataIndex,
+    TensorProperties,
+)
+from torch.distributed.checkpoint.planner import (
+    SavePlan,
+    SavePlanner,
+    TensorWriteData,
+    WriteItem,
+    WriteItemType,
+)
 
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.core import maybe_load_config
@@ -170,18 +184,186 @@ class _StreamingTensorPlan:
 
 
 @dataclass(frozen=True)
-class _DirectDcpPrivateApi:
-    current_dcp_version: str
-    default_suffix: str
-    storage_info_cls: Any
-    metadata_file_name: str
-    bytes_storage_metadata_cls: Any
-    chunk_storage_metadata_cls: Any
-    dcp_metadata_cls: Any
-    metadata_index_cls: Any
-    storage_meta_cls: Any
-    tensor_properties_cls: Any
-    tensor_storage_metadata_cls: Any
+class _DirectDcpWriteSpec:
+    path: tuple[Union[str, int], ...]
+    template_leaf: Any
+    sharded_key: str
+    global_shape: tuple[int, ...]
+    global_offsets: tuple[int, ...]
+    chunk_shape: tuple[int, ...]
+    target_dtype: torch.dtype
+    chunk_dim: int
+    chunk_start: int
+    chunk_length: int
+    source_dtype: Optional[torch.dtype] = None
+    source_shape: Optional[tuple[int, ...]] = None
+    is_extra_state: bool = False
+
+
+class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
+    """Public DCP planner that resolves exactly one merged output chunk per item."""
+
+    def __init__(
+        self,
+        *,
+        write_specs: list[_DirectDcpWriteSpec],
+        resolved_input_dirs: list[Path],
+        weights: list[float],
+        load_strategies: dict[Path, TorchDistLoadShardedStrategy],
+        extra_state_source_index: int,
+    ) -> None:
+        self.write_specs = write_specs
+        self.resolved_input_dirs = resolved_input_dirs
+        self.weights = weights
+        self.load_strategies = load_strategies
+        self.extra_state_source_index = extra_state_source_index
+        self.load_time = 0.0
+        self.accumulation_time = 0.0
+        self.resolved_tensor_count = 0
+        self.max_resolved_output_tensor_bytes = 0
+        self._write_spec_by_index = {
+            (spec.sharded_key, spec.global_offsets, spec.chunk_shape): spec
+            for spec in write_specs
+        }
+        self._plan = SavePlan([])
+
+    def set_up_planner(
+        self,
+        state_dict: ShardedStateDict,
+        storage_meta: Any = None,
+        is_coordinator: bool = False,
+    ) -> None:
+        self._state_dict = state_dict
+        self._storage_meta = storage_meta
+        self._is_coordinator = is_coordinator
+
+    def create_local_plan(self) -> SavePlan:
+        items = [
+            self._write_item(spec, index)
+            for index, spec in enumerate(self.write_specs)
+        ]
+        self._plan = SavePlan(items)
+        return self._plan
+
+    def create_global_plan(self, all_plans: list[SavePlan]) -> tuple[list[SavePlan], Any]:
+        return create_default_global_save_plan(all_plans)
+
+    def finish_plan(self, new_plan: SavePlan) -> SavePlan:
+        self._plan = new_plan
+        return self._plan
+
+    def resolve_data(self, write_item: WriteItem) -> torch.Tensor:
+        if write_item.type != WriteItemType.SHARD or write_item.tensor_data is None:
+            raise WeightedMergeError("direct-dcp-streaming emits only tensor shard write items.")
+        chunk = write_item.tensor_data.chunk
+        spec_key = (
+            write_item.index.fqn,
+            tuple(int(offset) for offset in chunk.offsets),
+            tuple(int(size) for size in chunk.sizes),
+        )
+        try:
+            spec = self._write_spec_by_index[spec_key]
+        except KeyError as exc:
+            raise WeightedMergeError(
+                "direct-dcp-streaming could not resolve public DCP write item "
+                f"for '{write_item.index.fqn}' at offsets={tuple(chunk.offsets)} "
+                f"sizes={tuple(chunk.sizes)}."
+            ) from exc
+        if spec.is_extra_state:
+            output = self._resolve_extra_state(spec)
+        else:
+            output = self._resolve_merged_chunk(spec)
+        self.resolved_tensor_count += 1
+        self.max_resolved_output_tensor_bytes = max(
+            self.max_resolved_output_tensor_bytes,
+            int(output.numel() * output.element_size()),
+        )
+        return output
+
+    @staticmethod
+    def _write_item(spec: _DirectDcpWriteSpec, index: int) -> WriteItem:
+        fake_tensor = torch.empty((), dtype=spec.target_dtype, device="cpu")
+        offsets = torch.Size(spec.global_offsets)
+        sizes = torch.Size(spec.chunk_shape)
+        return WriteItem(
+            index=MetadataIndex(spec.sharded_key, offsets, index),
+            type=WriteItemType.SHARD,
+            tensor_data=TensorWriteData(
+                chunk=ChunkStorageMetadata(offsets=offsets, sizes=sizes),
+                properties=TensorProperties.create_from_tensor(fake_tensor),
+                size=torch.Size(spec.global_shape),
+            ),
+        )
+
+    def _resolve_merged_chunk(self, spec: _DirectDcpWriteSpec) -> torch.Tensor:
+        if spec.source_dtype is None or spec.source_shape is None:
+            raise WeightedMergeError(
+                f"Direct DCP tensor plan for '{_path_label(spec.path, spec.template_leaf)}' "
+                "is missing source metadata."
+            )
+        load_leaf = _streaming_chunk_leaf(
+            spec.template_leaf,
+            chunk_dim=spec.chunk_dim,
+            chunk_start=spec.chunk_start,
+            chunk_length=spec.chunk_length,
+            dtype=spec.source_dtype,
+            global_shape=spec.source_shape,
+        )
+        path_leaves = [(spec.path, load_leaf)]
+        accumulator = torch.zeros(spec.chunk_shape, dtype=torch.float32, device="cpu")
+        for checkpoint_dir, weight in zip(self.resolved_input_dirs, self.weights):
+            load_start = time.perf_counter()
+            loaded_by_path = _load_tensor_path_group_fast(
+                checkpoint_dir,
+                path_leaves,
+                self.load_strategies[checkpoint_dir],
+            )
+            self.load_time += time.perf_counter() - load_start
+            tensor = _as_tensor(loaded_by_path[spec.path])
+            if tensor is None:
+                raise WeightedMergeError(
+                    f"Checkpoint {checkpoint_dir} key '{_path_label(spec.path)}' "
+                    "is not a tensor."
+                )
+            if not tensor.is_floating_point():
+                raise WeightedMergeError(
+                    f"Checkpoint {checkpoint_dir} key '{_path_label(spec.path)}' "
+                    f"has non-floating dtype {tensor.dtype}; weighted averaging is "
+                    "only supported for floating tensors."
+                )
+            if tuple(tensor.shape) != spec.chunk_shape:
+                if tensor.numel() != accumulator.numel():
+                    raise WeightedMergeError(
+                        f"Checkpoint {checkpoint_dir} key '{_path_label(spec.path)}' "
+                        f"loaded chunk shape {tuple(tensor.shape)} cannot be reshaped "
+                        f"to {spec.chunk_shape}."
+                    )
+                tensor = tensor.reshape(spec.chunk_shape)
+            accumulation_start = time.perf_counter()
+            accumulator.add_(tensor.detach().to(dtype=torch.float32, device="cpu"), alpha=weight)
+            self.accumulation_time += time.perf_counter() - accumulation_start
+        return accumulator.to(dtype=spec.target_dtype).contiguous()
+
+    def _resolve_extra_state(self, spec: _DirectDcpWriteSpec) -> torch.Tensor:
+        load_leaf = copy.deepcopy(spec.template_leaf)
+        template_tensor = _as_tensor(load_leaf)
+        if template_tensor is not None:
+            _assign_leaf_data(load_leaf, torch.empty_like(template_tensor, device="cpu"))
+        load_start = time.perf_counter()
+        loaded = _load_path_group(
+            self.resolved_input_dirs[self.extra_state_source_index],
+            [(spec.path, load_leaf)],
+            strict=StrictHandling.ASSUME_OK_UNEXPECTED,
+        )
+        self.load_time += time.perf_counter() - load_start
+        value = _copy_loaded_value(loaded[spec.path])
+        tensor = _as_tensor(value)
+        if tensor is None:
+            raise WeightedMergeError(
+                "direct-dcp-streaming currently supports tensor _extra_state leaves only; "
+                f"'{_path_label(spec.path, spec.template_leaf)}' loaded as {type(value).__name__}."
+            )
+        return tensor.detach().cpu().contiguous()
 
 
 def is_rank_0() -> bool:
@@ -1493,66 +1675,6 @@ def _report_save_metadata_cache_reuse(
     return save_metadata_cache_reused
 
 
-def _require_direct_dcp_private_api() -> _DirectDcpPrivateApi:
-    """Import and validate private DCP pieces used by the direct writer."""
-
-    try:
-        from torch.distributed.checkpoint.filesystem import (  # type: ignore[attr-defined]
-            CURRENT_DCP_VERSION,
-            DEFAULT_SUFFIX,
-            _StorageInfo,
-            _metadata_fn,
-        )
-        from torch.distributed.checkpoint.metadata import (
-            BytesStorageMetadata,
-            ChunkStorageMetadata,
-            Metadata,
-            MetadataIndex,
-            StorageMeta,
-            TensorProperties,
-            TensorStorageMetadata,
-        )
-    except Exception as exc:
-        raise WeightedMergeError(
-            "direct-dcp-streaming requires PyTorch DCP filesystem private APIs "
-            "(_StorageInfo, _metadata_fn, CURRENT_DCP_VERSION, DEFAULT_SUFFIX). "
-            "This PyTorch build does not expose the expected API; use "
-            "--merge-execution-mode=file-backed-streaming or baseline."
-        ) from exc
-
-    missing = [
-        name
-        for name, value in {
-            "CURRENT_DCP_VERSION": CURRENT_DCP_VERSION,
-            "DEFAULT_SUFFIX": DEFAULT_SUFFIX,
-            "_StorageInfo": _StorageInfo,
-            "_metadata_fn": _metadata_fn,
-            "MetadataIndex": MetadataIndex,
-            "TensorStorageMetadata": TensorStorageMetadata,
-        }.items()
-        if value is None
-    ]
-    if missing:
-        raise WeightedMergeError(
-            "direct-dcp-streaming cannot run because PyTorch DCP private APIs are "
-            f"incomplete: {', '.join(missing)}."
-        )
-
-    return _DirectDcpPrivateApi(
-        current_dcp_version=CURRENT_DCP_VERSION,
-        default_suffix=DEFAULT_SUFFIX,
-        storage_info_cls=_StorageInfo,
-        metadata_file_name=_metadata_fn,
-        bytes_storage_metadata_cls=BytesStorageMetadata,
-        chunk_storage_metadata_cls=ChunkStorageMetadata,
-        dcp_metadata_cls=Metadata,
-        metadata_index_cls=MetadataIndex,
-        storage_meta_cls=StorageMeta,
-        tensor_properties_cls=TensorProperties,
-        tensor_storage_metadata_cls=TensorStorageMetadata,
-    )
-
-
 def _direct_dcp_global_offsets(
     leaf: Any, *, chunk_dim: int, chunk_start: int
 ) -> torch.Size:
@@ -1569,33 +1691,6 @@ def _direct_dcp_global_offsets(
 
 def _direct_dcp_chunk_sizes(chunk_shape: Iterable[int]) -> torch.Size:
     return torch.Size(tuple(int(dim) for dim in chunk_shape))
-
-
-def _write_direct_dcp_payload(stream: Any, payload: Any) -> tuple[int, int]:
-    offset = stream.tell()
-    torch.save(payload, stream)
-    return int(offset), int(stream.tell() - offset)
-
-
-def _write_direct_dcp_metadata(
-    *,
-    checkpoint_dir: Path,
-    api: _DirectDcpPrivateApi,
-    state_dict_metadata: dict[str, Any],
-    storage_data: dict[Any, Any],
-) -> None:
-    metadata = api.dcp_metadata_cls(
-        state_dict_metadata=state_dict_metadata,
-        storage_data=storage_data,
-        storage_meta=api.storage_meta_cls(
-            checkpoint_id=str(checkpoint_dir), save_id="weighted-merge-direct-dcp-streaming"
-        ),
-        version=api.current_dcp_version,
-    )
-    temporary_metadata = checkpoint_dir / f"{api.metadata_file_name}.tmp"
-    with temporary_metadata.open("wb") as metadata_file:
-        pickle.dump(metadata, metadata_file)
-    temporary_metadata.rename(checkpoint_dir / api.metadata_file_name)
 
 
 def _validate_direct_dcp_plan(plan: _StreamingTensorPlan) -> None:
@@ -1624,6 +1719,120 @@ def _validate_direct_dcp_plan(plan: _StreamingTensorPlan) -> None:
         )
 
 
+def _build_direct_dcp_write_specs(
+    *,
+    tensor_plans: list[_StreamingTensorPlan],
+    extra_paths: list[tuple[Union[str, int], ...]],
+    initial_template: ShardedStateDict,
+    tensor_metadata_by_checkpoint: list[dict[str, Any]],
+    extra_state_source_index: int,
+    streaming_chunk_bytes: int,
+) -> tuple[list[_DirectDcpWriteSpec], int]:
+    write_specs: list[_DirectDcpWriteSpec] = []
+    merge_chunk_count = 0
+
+    for plan in tensor_plans:
+        _validate_direct_dcp_plan(plan)
+        if plan.source_dtype is None or plan.source_shape is None:
+            raise WeightedMergeError(
+                f"Direct DCP tensor plan for '{_path_label(plan.path, plan.template_leaf)}' "
+                "is missing source metadata."
+            )
+        sharded_key = str(getattr(plan.template_leaf, "key"))
+        for chunk_dim, chunk_start, chunk_length in _chunk_ranges_for_local_shape(
+            plan.template_shape, streaming_chunk_bytes
+        ):
+            if chunk_length == 0:
+                continue
+            chunk_shape = list(plan.template_shape)
+            if chunk_dim >= 0:
+                chunk_shape[chunk_dim] = chunk_length
+            chunk_shape_tuple = tuple(int(dim) for dim in chunk_shape)
+            write_specs.append(
+                _DirectDcpWriteSpec(
+                    path=plan.path,
+                    template_leaf=plan.template_leaf,
+                    sharded_key=sharded_key,
+                    global_shape=tuple(int(dim) for dim in plan.source_shape),
+                    global_offsets=tuple(
+                        int(offset)
+                        for offset in _direct_dcp_global_offsets(
+                            plan.template_leaf,
+                            chunk_dim=chunk_dim,
+                            chunk_start=chunk_start,
+                        )
+                    ),
+                    chunk_shape=tuple(
+                        int(size) for size in _direct_dcp_chunk_sizes(chunk_shape_tuple)
+                    ),
+                    target_dtype=plan.target_dtype,
+                    chunk_dim=chunk_dim,
+                    chunk_start=chunk_start,
+                    chunk_length=chunk_length,
+                    source_dtype=plan.source_dtype,
+                    source_shape=plan.source_shape,
+                )
+            )
+            merge_chunk_count += 1
+
+    extra_metadata = tensor_metadata_by_checkpoint[extra_state_source_index]
+    for path in extra_paths:
+        template_leaf = _get_path(initial_template, path)
+        sharded_key = getattr(template_leaf, "key", None)
+        if not sharded_key:
+            raise WeightedMergeError(
+                f"direct-dcp-streaming requires a sharded key for _extra_state "
+                f"'{_path_label(path, template_leaf)}'."
+            )
+        template_tensor = _as_tensor(template_leaf)
+        if template_tensor is None:
+            raise WeightedMergeError(
+                "direct-dcp-streaming currently supports tensor _extra_state leaves only; "
+                f"'{_path_label(path, template_leaf)}' is {type(template_leaf).__name__}."
+            )
+        if sharded_key not in extra_metadata:
+            raise WeightedMergeError(
+                f"Checkpoint {extra_state_source_index} is missing tensor metadata for "
+                f"_extra_state '{_path_label(path, template_leaf)}'."
+            )
+        metadata_entry = extra_metadata[sharded_key]
+        metadata_shape = tuple(int(dim) for dim in metadata_entry.global_shape)
+        expected_shape = _global_shape_tuple(template_leaf)
+        if expected_shape is not None and metadata_shape != expected_shape:
+            raise WeightedMergeError(
+                f"Shape mismatch for _extra_state '{_path_label(path, template_leaf)}': "
+                f"template expects global shape {expected_shape}, but checkpoint metadata "
+                f"has {metadata_shape}."
+            )
+        chunk_shape = tuple(int(dim) for dim in template_tensor.shape)
+        write_specs.append(
+            _DirectDcpWriteSpec(
+                path=path,
+                template_leaf=template_leaf,
+                sharded_key=str(sharded_key),
+                global_shape=metadata_shape,
+                global_offsets=tuple(
+                    int(offset)
+                    for offset in _direct_dcp_global_offsets(
+                        template_leaf,
+                        chunk_dim=-1,
+                        chunk_start=0,
+                    )
+                ),
+                chunk_shape=chunk_shape,
+                target_dtype=metadata_entry.dtype,
+                chunk_dim=-1,
+                chunk_start=0,
+                chunk_length=1,
+                source_dtype=metadata_entry.dtype,
+                source_shape=metadata_shape,
+                is_extra_state=True,
+            )
+        )
+
+    return write_specs, merge_chunk_count
+
+
 def _merge_direct_dcp_streaming(
     *,
     resolved_input_dirs: list[Path],
@@ -1648,7 +1857,6 @@ def _merge_direct_dcp_streaming(
             "Use file-backed-streaming for distributed merge-time world sizes."
         )
 
-    api = _require_direct_dcp_private_api()
     from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
     from megatron.core.dist_checkpointing.strategies.common import save_common
 
@@ -1688,171 +1896,48 @@ def _merge_direct_dcp_streaming(
         )
         for tensor_index, path in enumerate(merge_paths)
     ]
-    for plan in tensor_plans:
-        _validate_direct_dcp_plan(plan)
-
-    storage_name = f"__0_0{api.default_suffix}"
-    storage_path = output_dir / storage_name
-    state_dict_metadata: dict[str, Any] = {}
-    storage_data: dict[Any, Any] = {}
-    load_time = 0.0
-    accumulation_time = 0.0
-    save_time = 0.0
-    tensor_chunk_count = 0
-
-    with storage_path.open("wb") as stream:
-        for plan in tensor_plans:
-            if plan.source_dtype is None or plan.source_shape is None:
-                raise WeightedMergeError(
-                    f"Direct DCP tensor plan for '{_path_label(plan.path, plan.template_leaf)}' "
-                    "is missing source metadata."
-                )
-            sharded_key = str(getattr(plan.template_leaf, "key"))
-            chunks = []
-            chunk_ranges = _chunk_ranges_for_local_shape(plan.template_shape, streaming_chunk_bytes)
-            for chunk_index, (chunk_dim, chunk_start, chunk_length) in enumerate(chunk_ranges):
-                if chunk_length == 0:
-                    continue
-                chunk_shape = list(plan.template_shape)
-                if chunk_dim >= 0:
-                    chunk_shape[chunk_dim] = chunk_length
-                chunk_shape_tuple = tuple(int(dim) for dim in chunk_shape)
-                load_leaf = _streaming_chunk_leaf(
-                    plan.template_leaf,
-                    chunk_dim=chunk_dim,
-                    chunk_start=chunk_start,
-                    chunk_length=chunk_length,
-                    dtype=plan.source_dtype,
-                    global_shape=plan.source_shape,
-                )
-                path_leaves = [(plan.path, load_leaf)]
-                accumulator = torch.zeros(chunk_shape_tuple, dtype=torch.float32, device="cpu")
-                for checkpoint_dir, weight in zip(resolved_input_dirs, weights):
-                    load_start = time.perf_counter()
-                    loaded_by_path = _load_tensor_path_group_fast(
-                        checkpoint_dir,
-                        path_leaves,
-                        streaming_load_strategies[checkpoint_dir],
-                    )
-                    load_time += time.perf_counter() - load_start
-                    tensor = _as_tensor(loaded_by_path[plan.path])
-                    if tensor is None:
-                        raise WeightedMergeError(
-                            f"Checkpoint {checkpoint_dir} key '{_path_label(plan.path)}' "
-                            "is not a tensor."
-                        )
-                    if not tensor.is_floating_point():
-                        raise WeightedMergeError(
-                            f"Checkpoint {checkpoint_dir} key '{_path_label(plan.path)}' "
-                            f"has non-floating dtype {tensor.dtype}; weighted averaging is "
-                            "only supported for floating tensors."
-                        )
-                    if tuple(tensor.shape) != chunk_shape_tuple:
-                        if tensor.numel() != accumulator.numel():
-                            raise WeightedMergeError(
-                                f"Checkpoint {checkpoint_dir} key '{_path_label(plan.path)}' "
-                                f"loaded chunk shape {tuple(tensor.shape)} cannot be reshaped "
-                                f"to {chunk_shape_tuple}."
-                            )
-                        tensor = tensor.reshape(chunk_shape_tuple)
-                    accumulation_start = time.perf_counter()
-                    accumulator.add_(
-                        tensor.detach().to(dtype=torch.float32, device="cpu"), alpha=weight
-                    )
-                    accumulation_time += time.perf_counter() - accumulation_start
-
-                output_chunk = accumulator.to(dtype=plan.target_dtype).contiguous()
-                save_start = time.perf_counter()
-                offset, length = _write_direct_dcp_payload(stream, output_chunk)
-                save_time += time.perf_counter() - save_start
-                global_offsets = _direct_dcp_global_offsets(
-                    plan.template_leaf, chunk_dim=chunk_dim, chunk_start=chunk_start
-                )
-                chunk_sizes = _direct_dcp_chunk_sizes(output_chunk.shape)
-                chunks.append(api.chunk_storage_metadata_cls(offsets=global_offsets, sizes=chunk_sizes))
-                storage_data[
-                    api.metadata_index_cls(sharded_key, global_offsets, chunk_index)
-                ] = api.storage_info_cls(
-                    relative_path=storage_name,
-                    offset=offset,
-                    length=length,
-                )
-                tensor_chunk_count += 1
-                del accumulator, output_chunk
-
-            state_dict_metadata[sharded_key] = api.tensor_storage_metadata_cls(
-                properties=api.tensor_properties_cls(dtype=plan.target_dtype),
-                size=torch.Size(plan.source_shape),
-                chunks=chunks,
-            )
-
-        if extra_paths:
-            extra_path_leaves: list[tuple[tuple[Union[str, int], ...], Any]] = []
-            for path in extra_paths:
-                template_leaf = _get_path(initial_template, path)
-                load_leaf = copy.deepcopy(template_leaf)
-                tensor = _as_tensor(load_leaf)
-                if tensor is not None:
-                    _assign_leaf_data(load_leaf, torch.empty_like(tensor, device="cpu"))
-                extra_path_leaves.append((path, load_leaf))
-
-            load_start = time.perf_counter()
-            loaded_extras = _load_path_group(
-                resolved_input_dirs[extra_state_source_index],
-                extra_path_leaves,
-                strict=StrictHandling.ASSUME_OK_UNEXPECTED,
-            )
-            load_time += time.perf_counter() - load_start
-            for path in extra_paths:
-                template_leaf = _get_path(initial_template, path)
-                sharded_key = getattr(template_leaf, "key", None)
-                if not sharded_key:
-                    raise WeightedMergeError(
-                        f"direct-dcp-streaming requires a sharded key for _extra_state "
-                        f"'{_path_label(path, template_leaf)}'."
-                    )
-                value = _copy_loaded_value(loaded_extras[path])
-                tensor = _as_tensor(value)
-                if tensor is None:
-                    raise WeightedMergeError(
-                        "direct-dcp-streaming currently supports tensor _extra_state leaves only; "
-                        f"'{_path_label(path, template_leaf)}' loaded as {type(value).__name__}."
-                    )
-                tensor = tensor.detach().cpu().contiguous()
-                save_start = time.perf_counter()
-                offset, length = _write_direct_dcp_payload(stream, tensor)
-                save_time += time.perf_counter() - save_start
-                global_offsets = _direct_dcp_global_offsets(
-                    template_leaf, chunk_dim=-1, chunk_start=0
-                )
-                chunk_sizes = _direct_dcp_chunk_sizes(tensor.shape)
-                state_dict_metadata[str(sharded_key)] = api.tensor_storage_metadata_cls(
-                    properties=api.tensor_properties_cls(dtype=tensor.dtype),
-                    size=torch.Size(getattr(template_leaf, "global_shape", tensor.shape)),
-                    chunks=[api.chunk_storage_metadata_cls(offsets=global_offsets, sizes=chunk_sizes)],
-                )
-                storage_data[api.metadata_index_cls(str(sharded_key), global_offsets, 0)] = (
-                    api.storage_info_cls(
-                        relative_path=storage_name,
-                        offset=offset,
-                        length=length,
-                    )
-                )
-
-    save_start = time.perf_counter()
-    _write_direct_dcp_metadata(
-        checkpoint_dir=output_dir,
-        api=api,
-        state_dict_metadata=state_dict_metadata,
-        storage_data=storage_data,
+    write_specs, tensor_chunk_count = _build_direct_dcp_write_specs(
+        tensor_plans=tensor_plans,
+        extra_paths=extra_paths,
+        initial_template=initial_template,
+        tensor_metadata_by_checkpoint=tensor_metadata_by_checkpoint,
+        extra_state_source_index=extra_state_source_index,
+        streaming_chunk_bytes=streaming_chunk_bytes,
     )
+
+    planner = _WeightedMergeDirectOutputSavePlanner(
+        write_specs=write_specs,
+        resolved_input_dirs=resolved_input_dirs,
+        weights=weights,
+        load_strategies=streaming_load_strategies,
+        extra_state_source_index=extra_state_source_index,
+    )
+    writer = FileSystemWriter(
+        output_dir,
+        single_file_per_rank=True,
+        sync_files=True,
+        thread_count=1,
+        per_thread_copy_ahead=0,
+    )
+    dcp_save_start = time.perf_counter()
+    torch_dcp.save({}, storage_writer=writer, planner=planner, no_dist=True)
+    dcp_save_wall_time = time.perf_counter() - dcp_save_start
+
+    sidecar_start = time.perf_counter()
     save_common(common_state, str(output_dir))
     save_config(CheckpointingConfig("torch_dist", 1), str(output_dir))
-    save_time += time.perf_counter() - save_start
+    sidecar_time = time.perf_counter() - sidecar_start
+
+    load_time = planner.load_time
+    accumulation_time = planner.accumulation_time
+    save_time = max(0.0, dcp_save_wall_time - load_time - accumulation_time) + sidecar_time
     print_rank_0(
         "Direct DCP streaming wrote "
         f"{len(tensor_plans)} tensors as {tensor_chunk_count} chunks with "
-        f"chunk_budget={_format_bytes(streaming_chunk_bytes)}",
+        f"chunk_budget={_format_bytes(streaming_chunk_bytes)}, "
+        f"max_resolved_output={_format_bytes(planner.max_resolved_output_tensor_bytes)}. "
+        "Output writing uses public DCP FileSystemWriter; source read volume follows "
+        "source checkpoint storage-record size, not the requested chunk size.",
         flush=True,
     )
     return load_time, accumulation_time, save_time, bytes_read
@@ -3032,8 +3117,9 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "'file-backed-streaming' loads one tensor chunk at a time and stages merged "
             "local shards through file-backed CPU tensors before final DCP save. "
             "'direct-dcp-streaming' is an experimental guarded single-rank torch_dist "
-            "prototype that writes output chunks directly to DCP storage without "
-            "file-backed full-output staging."
+            "prototype that writes output chunks with public DCP FileSystemWriter "
+            "without file-backed full-output staging; source reads still follow the "
+            "source checkpoint storage-record layout."
         ),
     )
     group.add_argument(
