@@ -37,6 +37,7 @@ import torch.distributed.checkpoint as torch_dcp
 from torch.distributed.checkpoint import CheckpointException, FileSystemReader, FileSystemWriter
 from torch.distributed.checkpoint.default_planner import create_default_global_save_plan
 from torch.distributed.checkpoint.metadata import (
+    BytesStorageMetadata,
     ChunkStorageMetadata,
     MetadataIndex,
     TensorProperties,
@@ -88,6 +89,7 @@ BYTE_ACCOUNTING_MODES = ("none", "rank0", "all")
 RESOURCE_LOG_MODES = ("none", "rank0", "all")
 FILE_BACKED_STAGING_LAYOUTS = ("shared-dtype", "per-tensor")
 METADATA_SAME_LAYOUT_MODEL_PREFIXES = ("model.", "model0.", "model1.")
+METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS = ("decoder.", "embedding.", "output_layer.")
 
 
 class WeightedMergeError(ValueError):
@@ -1864,7 +1866,19 @@ def _build_direct_dcp_write_specs(
 def _metadata_same_layout_is_model_key(
     fqn: str, model_key_prefixes: tuple[str, ...]
 ) -> bool:
-    return any(fqn.startswith(prefix) for prefix in model_key_prefixes)
+    return any(fqn.startswith(prefix) for prefix in model_key_prefixes) or any(
+        fqn.startswith(root) for root in METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS
+    )
+
+
+def _metadata_same_layout_is_extra_state_key(fqn: str) -> bool:
+    return (
+        fqn == "_extra_state"
+        or fqn.endswith("._extra_state")
+        or fqn.startswith("_extra_state/")
+        or "._extra_state/" in fqn
+        or "._extra_state." in fqn
+    )
 
 
 def _metadata_same_layout_path(fqn: str) -> tuple[Union[str, int], ...]:
@@ -1914,13 +1928,27 @@ def _read_public_dcp_tensor_metadata(
 
     tensor_metadata: dict[str, TensorStorageMetadata] = {}
     non_tensor_model_keys: list[str] = []
+    byte_extra_state_model_keys: list[str] = []
     for fqn, metadata_entry in metadata.state_dict_metadata.items():
         fqn = str(fqn)
         if isinstance(metadata_entry, TensorStorageMetadata):
             tensor_metadata[fqn] = metadata_entry
         elif _metadata_same_layout_is_model_key(fqn, model_key_prefixes):
-            non_tensor_model_keys.append(fqn)
+            if isinstance(metadata_entry, BytesStorageMetadata) and (
+                _metadata_same_layout_is_extra_state_key(fqn)
+            ):
+                byte_extra_state_model_keys.append(fqn)
+            else:
+                non_tensor_model_keys.append(fqn)
 
+    if byte_extra_state_model_keys:
+        sample = ", ".join(sorted(byte_extra_state_model_keys)[:5])
+        raise WeightedMergeError(
+            "metadata-same-layout cannot copy byte/object _extra_state DCP entries "
+            "through the public metadata-only path; refusing to silently drop required "
+            f"model state in {checkpoint_dir}: {sample}. Use an execution mode that "
+            "builds a checkpoint template, or remove/convert byte _extra_state entries."
+        )
     if non_tensor_model_keys:
         sample = ", ".join(sorted(non_tensor_model_keys)[:5])
         raise WeightedMergeError(
@@ -1946,7 +1974,8 @@ def _metadata_same_layout_model_keys(
         raise WeightedMergeError(
             "metadata-same-layout refuses to infer merge policy for non-model "
             f"DCP tensor keys in {checkpoint_dir}: {sample}. "
-            f"Allowed prefixes are {model_key_prefixes}."
+            f"Allowed prefixes are {model_key_prefixes}; allowed unprefixed roots are "
+            f"{METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS}."
         )
     model_keys = tuple(sorted(tensor_metadata))
     if not model_keys:

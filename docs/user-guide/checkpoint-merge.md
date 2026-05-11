@@ -153,11 +153,13 @@ CPU, and writes the output through public DCP.
 
 Use this mode only when every input checkpoint has the same model tensor key set,
 global shapes, DCP chunk offsets/sizes, and, for `--merge-save-dtype=same`,
-dtypes. The mode currently infers mergeable model tensors only from keys
-starting with `model.`, `model0.`, or `model1.`. It rejects non-model DCP tensor
-entries and non-tensor model metadata because it cannot infer a safe merge policy
-for optimizer state, RNG state, or object metadata. Tensor `_extra_state` entries
-are copied from `--extra-state-source-index`.
+dtypes. The mode infers mergeable model tensors from keys starting with
+`model.`, `model0.`, or `model1.`, and from unprefixed Megatron GPT model roots
+`decoder.`, `embedding.`, and `output_layer.`. It rejects other DCP tensor roots
+instead of guessing whether they are optimizer, RNG, or other non-model state.
+Tensor `_extra_state` entries are copied from `--extra-state-source-index`.
+Byte/object `_extra_state` entries are rejected in this metadata-only mode
+because the public metadata path cannot copy them without a checkpoint template.
 
 This mode supports manual `PATH:WEIGHT` inputs and simple start/end checkpoint
 selection. It does not support token-window selection, `--verify-load`,

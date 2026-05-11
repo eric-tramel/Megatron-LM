@@ -167,6 +167,57 @@ def _write_generated_gpt_checkpoint(path, value):
     dist_checkpointing.save(_generated_gpt_model_state(value), str(path))
 
 
+def _unprefixed_gpt_like_model_state(value):
+    return {
+        "decoder.final_layernorm.weight": ShardedTensor.from_rank_offsets(
+            "decoder.final_layernorm.weight",
+            torch.full((3,), value, dtype=torch.float32),
+            replica_id=0,
+        ),
+        "decoder.layers.0.mlp.linear_fc1.weight": ShardedTensor.from_rank_offsets(
+            "decoder.layers.0.mlp.linear_fc1.weight",
+            torch.full((2, 3), value + 1, dtype=torch.float32),
+            replica_id=0,
+        ),
+        "embedding.word_embeddings.weight": ShardedTensor.from_rank_offsets(
+            "embedding.word_embeddings.weight",
+            torch.full((4, 3), value + 2, dtype=torch.float32),
+            replica_id=0,
+        ),
+        "output_layer.weight": ShardedTensor.from_rank_offsets(
+            "output_layer.weight",
+            torch.full((4, 3), value + 3, dtype=torch.float32),
+            replica_id=0,
+        ),
+    }
+
+
+def _write_unprefixed_gpt_like_checkpoint(path, value):
+    dist_checkpointing.save(_unprefixed_gpt_like_model_state(value), str(path))
+
+
+def _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(path, value, extra_value):
+    state = _unprefixed_gpt_like_model_state(value)
+    state["decoder.layers.0.mlp.linear_fc1._extra_state"] = ShardedObject(
+        "decoder.layers.0.mlp.linear_fc1._extra_state",
+        _bytesio_state(extra_value),
+        (_world_size(),),
+        (_rank(),),
+        replica_id=0,
+    )
+    dist_checkpointing.save(state, str(path))
+
+
+def _write_unprefixed_gpt_like_checkpoint_with_optimizer_tensor(path, value):
+    state = _unprefixed_gpt_like_model_state(value)
+    state["optimizer.param_groups.0.lr"] = ShardedTensor.from_rank_offsets(
+        "optimizer.param_groups.0.lr",
+        torch.tensor([value], dtype=torch.float32),
+        replica_id=0,
+    )
+    dist_checkpointing.save(state, str(path))
+
+
 def _split_weight_factory(sharded_tensor):
     sharded_tensor_without_data = sharded_tensor.without_data()
     split_point = sharded_tensor.data.shape[0] // 2
@@ -1472,6 +1523,85 @@ def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder
                 assert output_chunks == source_chunks
     finally:
         ps.destroy_model_parallel()
+
+
+def test_metadata_same_layout_unprefixed_gpt_model_tensor_roots_round_trip(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_unprefixed_gpt_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_unprefixed_gpt_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_unprefixed_gpt_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint(ckpt_a, 1.0)
+        _write_unprefixed_gpt_like_checkpoint(ckpt_b, 5.0)
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=50,
+        )
+
+        assert result.output_dir == output_root / "iter_0000050"
+        assert result.averaged_tensors == 4
+        assert result.copied_extra_states == 0
+
+        public_state = {
+            "decoder.final_layernorm.weight": torch.empty((3,), dtype=torch.float32),
+            "decoder.layers.0.mlp.linear_fc1.weight": torch.empty((2, 3), dtype=torch.float32),
+            "embedding.word_embeddings.weight": torch.empty((4, 3), dtype=torch.float32),
+            "output_layer.weight": torch.empty((4, 3), dtype=torch.float32),
+        }
+        torch_dcp.load(public_state, checkpoint_id=str(result.output_dir), no_dist=True)
+
+        assert torch.equal(public_state["decoder.final_layernorm.weight"], torch.full((3,), 4.0))
+        assert torch.equal(
+            public_state["decoder.layers.0.mlp.linear_fc1.weight"],
+            torch.full((2, 3), 5.0),
+        )
+        assert torch.equal(public_state["embedding.word_embeddings.weight"], torch.full((4, 3), 6.0))
+        assert torch.equal(public_state["output_layer.weight"], torch.full((4, 3), 7.0))
+
+
+def test_metadata_same_layout_rejects_unprefixed_byte_extra_state(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_unprefixed_bytes_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_unprefixed_bytes_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_unprefixed_bytes_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(ckpt_a, 1.0, 111)
+        _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(ckpt_b, 5.0, 999)
+
+        with pytest.raises(WeightedMergeError, match="byte/object _extra_state"):
+            merge_same_layout_dcp_metadata_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                output_iteration=51,
+            )
+
+
+def test_metadata_same_layout_rejects_unprefixed_non_model_tensor_root(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_unprefixed_optim_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_unprefixed_optim_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_unprefixed_optim_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint_with_optimizer_tensor(ckpt_a, 1.0)
+        _write_unprefixed_gpt_like_checkpoint(ckpt_b, 5.0)
+
+        with pytest.raises(WeightedMergeError, match="non-model DCP tensor keys"):
+            merge_same_layout_dcp_metadata_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                output_iteration=52,
+            )
 
 
 def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monkeypatch):
