@@ -142,26 +142,39 @@ building a performance table for a PR.
 
 ## Experimental Direct DCP Streaming
 
-`--merge-execution-mode=direct-dcp-streaming` is an experimental, guarded
-single-rank `torch_dist` prototype. It streams fp32-accumulated output chunks
-through a tool-local public PyTorch DCP `SavePlanner` and public
-`FileSystemWriter`, avoiding the file-backed full-output staging tensor used by
-`file-backed-streaming` in local tests.
+`--merge-execution-mode=direct-dcp-streaming` is an experimental `torch_dist`
+output path. It streams fp32-accumulated output chunks through a tool-local
+public PyTorch DCP `SavePlanner` and public `FileSystemWriter`, avoiding the
+file-backed full-output staging tensor used by `file-backed-streaming` in local
+tests.
 
 Use this mode only as an opt-in experiment. It no longer constructs private DCP
-output storage records or manually writes DCP metadata/payloads, but it still
-rejects merge-time world sizes greater than one. It supports ordinary
-`ShardedTensor` leaves in the tested local fixtures, copies tensor
-`_extra_state` entries from the selected source checkpoint, and can be validated
-with `--verify-load`.
+output storage records or manually writes DCP metadata/payloads. When no process
+group is initialized, or when the initialized world size is one, it calls public
+DCP save with `no_dist=True`. When a process group is initialized with world
+size greater than one, it uses public distributed DCP save. Rank 0 writes the
+Megatron sidecars and latest marker through the normal publication path after
+public DCP save succeeds.
+
+Current product-level two-rank CPU/gloo coverage passes for ordinary
+`ShardedTensor` leaves plus tensor `_extra_state`. The test checks duplicate-free
+DCP metadata and storage records, rank-distinct public DCP readback, Megatron
+rank-local readback, rank-0 `common.pt` and `metadata.json` sidecars,
+`latest_checkpointed_iteration.txt`, and invariance against
+`file-backed-streaming` for the tested fixture. The focused direct subset reports
+`6 passed, 77 deselected, 30 warnings`; the two-rank `torchrun` row reports
+`1 passed, 82 deselected, 28 warnings` per rank; the full weighted-merge unit
+module reports `82 passed, 1 skipped, 88 warnings`.
 
 This mode is output-bounded only for ordinary one-payload source checkpoints.
 Local source-read instrumentation showed that a 1 MiB logical request against a
 normal source tensor caused PyTorch DCP to deserialize the full 16 MiB stored
 payload before narrowing; a chunked-source layout loaded the 1 MiB source chunk.
 End-to-end bounded RSS therefore requires chunked source checkpoint storage or a
-lower-level reader that avoids full-payload deserialization. Multi-rank behavior,
-`ShardedTensorFactory` support, prepended-axis or flattened-range tensors, object
-`_extra_state` support, generated model-family coverage, and Super-scale RSS are
-also not validated. Use `file-backed-streaming` for those layouts until the
-direct writer is broadened and validated.
+lower-level reader that avoids full-payload deserialization. Broad layouts and
+model families, `ShardedTensorFactory` support, prepended-axis or
+flattened-range tensors, object `_extra_state` support, Super-scale RSS, and
+literal 1T+ proof are not validated by the current direct-output evidence. Hard
+rank death or process-group hangs still rely on launcher/process-group timeout.
+`--no-atomic-merge-output` and post-publication `--verify-load` remain outside
+stronger failure-atomic claims.

@@ -2,6 +2,7 @@
 
 import ast
 import io
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -189,6 +190,55 @@ def _write_prepended_axis_checkpoint(path, value, *, iteration=0, shape=(4, 2)):
 
 def _load_checkpoint(path, *, dtype=torch.float32, shape=(2, 2)):
     return dist_checkpointing.load(_template(dtype=dtype, shape=shape), str(path))
+
+
+def _full_public_dcp_state(path, *, dtype=torch.float32, shape=(2, 2)):
+    world_size = _world_size()
+    state_dict = {
+        "model.weight": torch.empty((shape[0] * world_size, shape[1]), dtype=dtype),
+        "model.bias": torch.empty((2 * world_size,), dtype=dtype),
+        "model.decoder.layers.0._extra_state": torch.empty((world_size,), dtype=torch.float32),
+    }
+    torch_dcp.load(state_dict, checkpoint_id=str(path), no_dist=True)
+    return state_dict
+
+
+def _dcp_metadata_summary(path):
+    metadata = torch_dcp.FileSystemReader(path).read_metadata()
+    chunk_records = []
+    for fqn, tensor_metadata in metadata.state_dict_metadata.items():
+        for chunk in getattr(tensor_metadata, "chunks", []) or []:
+            chunk_records.append(
+                (
+                    fqn,
+                    tuple(int(offset) for offset in chunk.offsets),
+                    tuple(int(size) for size in chunk.sizes),
+                )
+            )
+
+    storage_data = getattr(metadata, "storage_data", {}) or {}
+    storage_records = [
+        (
+            getattr(record, "relative_path", None),
+            getattr(record, "offset", None),
+            getattr(record, "length", None),
+        )
+        for record in storage_data.values()
+    ]
+    duplicate_chunk_offsets = {
+        key: count
+        for key, count in Counter((fqn, offsets) for fqn, offsets, _ in chunk_records).items()
+        if count > 1
+    }
+    duplicate_storage_records = {
+        key: count for key, count in Counter(storage_records).items() if count > 1
+    }
+    return {
+        "chunk_records": chunk_records,
+        "duplicate_chunk_offsets": duplicate_chunk_offsets,
+        "duplicate_storage_records": duplicate_storage_records,
+        "storage_file_count": len({str(record[0]) for record in storage_records}),
+    }
 
 
 def _bytesio_state(value):
@@ -1225,6 +1275,105 @@ def test_direct_dcp_streaming_bfloat16_save_dtype_and_chunk_metadata(
         assert all(chunk.sizes.numel() < torch.Size(shape).numel() for chunk in weight_metadata.chunks)
 
 
+def test_direct_dcp_streaming_two_rank_product_round_trip_public_metadata(
+    tmp_path_dist_ckpt, process_group
+):
+    if _world_size() != 2:
+        pytest.skip("two-rank direct-DCP product coverage requires torchrun --nproc_per_node=2")
+
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_two_rank_a", sync=True) as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_two_rank_b", sync=True) as ckpt_b,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_direct_two_rank_out", sync=True
+        ) as output_root,
+    ):
+        rank = _rank()
+        _write_checkpoint(ckpt_a, 1.0 + rank, extra_value=111.0 + rank, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0 + (2 * rank), extra_value=999.0 + rank, iteration=2)
+
+        direct = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            lambda: _template(),
+            output_iteration=30,
+            execution_mode="direct-dcp-streaming",
+            streaming_chunk_bytes=16,
+            verify_load=True,
+        )
+        file_backed = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "file_backed",
+            lambda: _template(),
+            execution_mode="file-backed-streaming",
+            streaming_chunk_bytes=16,
+            verify_load=True,
+        )
+
+        direct_loaded = _load_checkpoint(direct.output_dir)
+        file_backed_loaded = _load_checkpoint(file_backed.output_dir)
+        assert direct.implementation_mode == "direct-dcp-streaming"
+        assert direct.world_size == 2
+        assert direct.verified_load
+        assert torch.equal(
+            direct_loaded["model"]["weight"], file_backed_loaded["model"]["weight"]
+        )
+        assert torch.equal(direct_loaded["model"]["bias"], file_backed_loaded["model"]["bias"])
+        assert torch.equal(
+            direct_loaded["model"]["decoder.layers.0._extra_state"],
+            file_backed_loaded["model"]["decoder.layers.0._extra_state"],
+        )
+        expected_rank_weight = 4.0 + (1.75 * rank)
+        assert torch.equal(
+            direct_loaded["model"]["weight"], torch.full((2, 2), expected_rank_weight)
+        )
+        assert torch.equal(
+            direct_loaded["model"]["bias"], torch.full((2,), expected_rank_weight + 1.0)
+        )
+        assert torch.equal(
+            direct_loaded["model"]["decoder.layers.0._extra_state"],
+            torch.tensor([111.0 + rank]),
+        )
+
+        direct_public = _full_public_dcp_state(direct.output_dir)
+        file_backed_public = _full_public_dcp_state(file_backed.output_dir)
+        expected_public_weight = torch.cat(
+            [torch.full((2, 2), 4.0), torch.full((2, 2), 5.75)], dim=0
+        )
+        expected_public_bias = torch.tensor([5.0, 5.0, 6.75, 6.75])
+        expected_public_extra = torch.tensor([111.0, 112.0])
+        assert torch.equal(direct_public["model.weight"], file_backed_public["model.weight"])
+        assert torch.equal(direct_public["model.bias"], file_backed_public["model.bias"])
+        assert torch.equal(
+            direct_public["model.decoder.layers.0._extra_state"],
+            file_backed_public["model.decoder.layers.0._extra_state"],
+        )
+        assert torch.equal(direct_public["model.weight"], expected_public_weight)
+        assert torch.equal(direct_public["model.bias"], expected_public_bias)
+        assert torch.equal(
+            direct_public["model.decoder.layers.0._extra_state"],
+            expected_public_extra,
+        )
+
+        metadata_summary = _dcp_metadata_summary(direct.output_dir)
+        assert not metadata_summary["duplicate_chunk_offsets"]
+        assert not metadata_summary["duplicate_storage_records"]
+        assert metadata_summary["storage_file_count"] == 2
+        assert len(metadata_summary["chunk_records"]) == 6
+
+        if _rank() == 0:
+            sidecars = {
+                path.name
+                for path in direct.output_dir.iterdir()
+                if path.name != ".metadata" and not path.name.endswith(".distcp")
+            }
+            assert sidecars == {"common.pt", "metadata.json"}
+            assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
+            assert len(list(direct.output_dir.glob("*.distcp"))) == 2
+
+
 def test_direct_dcp_streaming_fails_clear_for_unsupported_factory(
     tmp_path_dist_ckpt, process_group
 ):
@@ -1247,27 +1396,17 @@ def test_direct_dcp_streaming_fails_clear_for_unsupported_factory(
             )
 
 
-def test_direct_dcp_streaming_keeps_single_rank_guard(tmp_path, monkeypatch):
+def test_direct_dcp_streaming_no_dist_branch_tracks_distributed_world_size(monkeypatch):
     monkeypatch.setattr(weighted_merge_module.dist, "is_available", lambda: True)
-    monkeypatch.setattr(weighted_merge_module.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(weighted_merge_module.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(weighted_merge_module.dist, "is_initialized", lambda: False)
+    assert weighted_merge_module._direct_dcp_save_uses_no_dist() is True
 
-    with pytest.raises(WeightedMergeError, match="guarded single-rank"):
-        weighted_merge_module._merge_direct_dcp_streaming(
-            resolved_input_dirs=[],
-            weights=[],
-            output_dir=tmp_path / "out",
-            initial_template={},
-            merge_paths=[],
-            extra_paths=[],
-            common_state={},
-            save_dtype="same",
-            extra_state_source_index=0,
-            strict=StrictHandling.RAISE_UNEXPECTED,
-            validate_access_integrity=True,
-            byte_accounting="none",
-            streaming_chunk_bytes=16,
-        )
+    monkeypatch.setattr(weighted_merge_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(weighted_merge_module.dist, "get_world_size", lambda: 1)
+    assert weighted_merge_module._direct_dcp_save_uses_no_dist() is True
+
+    monkeypatch.setattr(weighted_merge_module.dist, "get_world_size", lambda: 2)
+    assert weighted_merge_module._direct_dcp_save_uses_no_dist() is False
 
 
 def test_direct_dcp_streaming_fails_clear_for_unsupported_prepended_axis_without_publication(

@@ -1017,6 +1017,12 @@ def _run_rank0_filesystem_op(description: str, operation: Callable[[], None]) ->
         raise WeightedMergeError(f"{description} failed on rank 0: {error_messages[0]}")
 
 
+def _direct_dcp_save_uses_no_dist() -> bool:
+    """Return whether direct DCP output should bypass distributed save orchestration."""
+
+    return not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1
+
+
 def _git_revision() -> Optional[str]:
     try:
         result = subprocess.run(
@@ -1861,12 +1867,6 @@ def _merge_direct_dcp_streaming(
 ) -> tuple[float, float, float, int]:
     """Stream merged chunks directly into PyTorch DCP storage and metadata."""
 
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() != 1:
-        raise WeightedMergeError(
-            "direct-dcp-streaming is currently a guarded single-rank prototype. "
-            "Use file-backed-streaming for distributed merge-time world sizes."
-        )
-
     from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
     from megatron.core.dist_checkpointing.strategies.common import save_common
 
@@ -1929,13 +1929,32 @@ def _merge_direct_dcp_streaming(
         thread_count=1,
         per_thread_copy_ahead=0,
     )
+    no_dist = _direct_dcp_save_uses_no_dist()
     dcp_save_start = time.perf_counter()
-    torch_dcp.save({}, storage_writer=writer, planner=planner, no_dist=True)
+    try:
+        torch_dcp.save({}, storage_writer=writer, planner=planner, no_dist=no_dist)
+    except Exception as exc:
+        rank_suffix = (
+            f" on rank {dist.get_rank()}"
+            if dist.is_available() and dist.is_initialized()
+            else ""
+        )
+        raise WeightedMergeError(
+            f"Direct DCP streaming save failed{rank_suffix}: {type(exc).__name__}: {exc}"
+        ) from exc
     dcp_save_wall_time = time.perf_counter() - dcp_save_start
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
     sidecar_start = time.perf_counter()
-    save_common(common_state, str(output_dir))
-    save_config(CheckpointingConfig("torch_dist", 1), str(output_dir))
+
+    def write_sidecars() -> None:
+        save_common(common_state, str(output_dir))
+        save_config(CheckpointingConfig("torch_dist", 1), str(output_dir))
+
+    _run_rank0_filesystem_op("Writing Megatron checkpoint sidecars", write_sidecars)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
     sidecar_time = time.perf_counter() - sidecar_start
 
     load_time = planner.load_time
@@ -3126,10 +3145,10 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "checkpoint tensors, fp32 accumulators, and merged output tensors on CPU. "
             "'file-backed-streaming' loads one tensor chunk at a time and stages merged "
             "local shards through file-backed CPU tensors before final DCP save. "
-            "'direct-dcp-streaming' is an experimental guarded single-rank torch_dist "
-            "prototype that writes output chunks with public DCP FileSystemWriter "
-            "without file-backed full-output staging; source reads still follow the "
-            "source checkpoint storage-record layout."
+            "'direct-dcp-streaming' writes output chunks directly with public DCP "
+            "FileSystemWriter, using distributed DCP save when the process group has "
+            "more than one rank, without file-backed full-output staging; source reads "
+            "still follow the source checkpoint storage-record layout."
         ),
     )
     group.add_argument(
