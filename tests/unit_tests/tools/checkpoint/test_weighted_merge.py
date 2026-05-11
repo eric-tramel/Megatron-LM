@@ -167,6 +167,38 @@ def _write_generated_gpt_checkpoint(path, value):
     dist_checkpointing.save(_generated_gpt_model_state(value), str(path))
 
 
+def _generated_moe_gpt_model_state(value):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        use_cpu_initialization=True,
+        add_bias_linear=True,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+    )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_local_spec(
+            num_experts=2,
+            moe_grouped_gemm=False,
+        ),
+        vocab_size=16,
+        max_sequence_length=8,
+        pre_process=True,
+        post_process=True,
+    )
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(value)
+    return model.sharded_state_dict(prefix="model.")
+
+
+def _write_generated_moe_gpt_checkpoint(path, value):
+    dist_checkpointing.save(_generated_moe_gpt_model_state(value), str(path))
+
+
 UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY = "decoder.layers.0.mlp.linear_fc1._extra_state"
 
 
@@ -1562,6 +1594,87 @@ def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder
 
             source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
             for fqn, output_tensor_metadata in output_metadata.state_dict_metadata.items():
+                source_chunks = [
+                    (tuple(chunk.offsets), tuple(chunk.sizes))
+                    for chunk in source_metadata.state_dict_metadata[fqn].chunks
+                ]
+                output_chunks = [
+                    (tuple(chunk.offsets), tuple(chunk.sizes))
+                    for chunk in output_tensor_metadata.chunks
+                ]
+                assert output_chunks == source_chunks
+    finally:
+        ps.destroy_model_parallel()
+
+
+def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_builder_path(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    def fail_model_path(*_args, **_kwargs):
+        raise AssertionError("metadata same-layout must not use model/template construction")
+
+    monkeypatch.setattr(weighted_merge_module, "_build_model_state_dict_factory", fail_model_path)
+    monkeypatch.setattr(weighted_merge_module, "_state_dict_for_execution_mode", fail_model_path)
+    monkeypatch.setattr(
+        weighted_merge_module.dist_checkpointing,
+        "load_tensors_metadata",
+        fail_model_path,
+    )
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(1, 1)
+    try:
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_generated_moe_gpt_a") as ckpt_a,
+            TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_generated_moe_gpt_b") as ckpt_b,
+            TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_generated_moe_gpt_out") as output_root,
+        ):
+            _write_generated_moe_gpt_checkpoint(ckpt_a, 1.0)
+            _write_generated_moe_gpt_checkpoint(ckpt_b, 5.0)
+
+            result = merge_same_layout_dcp_metadata_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                output_iteration=41,
+                extra_state_source_index=1,
+            )
+
+            assert result.output_dir == output_root / "iter_0000041"
+            assert result.implementation_mode == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
+            assert result.averaged_tensors == 19
+            assert result.copied_extra_states == 6
+            assert result.memory_estimate.template_devices == ("cpu",)
+
+            output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+            object_metadata_keys = [
+                fqn
+                for fqn, metadata in output_metadata.state_dict_metadata.items()
+                if not hasattr(metadata, "size")
+            ]
+            assert len(object_metadata_keys) == 6
+            assert all("_extra_state" in fqn for fqn in object_metadata_keys)
+            tensor_state = {
+                fqn: torch.empty(
+                    tuple(int(dim) for dim in metadata.size),
+                    dtype=metadata.properties.dtype,
+                )
+                for fqn, metadata in output_metadata.state_dict_metadata.items()
+                if hasattr(metadata, "size")
+            }
+            assert any(fqn.endswith(".mlp.router.weight") for fqn in tensor_state)
+            assert any(fqn.endswith(".mlp.router.bias") for fqn in tensor_state)
+            expert_tensor_keys = [fqn for fqn in tensor_state if ".mlp.experts." in fqn]
+            assert len(expert_tensor_keys) == 4
+            assert not any(fqn.endswith("._extra_state") for fqn in tensor_state)
+
+            torch_dcp.load(tensor_state, checkpoint_id=str(result.output_dir), no_dist=True)
+            for fqn, tensor in tensor_state.items():
+                assert torch.equal(tensor, torch.full_like(tensor, 4.0)), fqn
+
+            source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
+            for fqn in tensor_state:
+                output_tensor_metadata = output_metadata.state_dict_metadata[fqn]
                 source_chunks = [
                     (tuple(chunk.offsets), tuple(chunk.sizes))
                     for chunk in source_metadata.state_dict_metadata[fqn].chunks
