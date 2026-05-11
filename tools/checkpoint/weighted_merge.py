@@ -34,7 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as torch_dcp
-from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
+from torch.distributed.checkpoint import CheckpointException, FileSystemReader, FileSystemWriter
 from torch.distributed.checkpoint.default_planner import create_default_global_save_plan
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
@@ -1100,7 +1100,7 @@ def _require_publishable_checkpoint_dir(checkpoint_dir: Path) -> None:
         )
     try:
         FileSystemReader(checkpoint_dir).read_metadata()
-    except Exception as exc:
+    except (Exception, CheckpointException) as exc:
         raise WeightedMergeError(
             f"Refusing to publish {checkpoint_dir} because DCP metadata is missing or unreadable."
         ) from exc
@@ -1933,7 +1933,7 @@ def _merge_direct_dcp_streaming(
     dcp_save_start = time.perf_counter()
     try:
         torch_dcp.save({}, storage_writer=writer, planner=planner, no_dist=no_dist)
-    except Exception as exc:
+    except (Exception, CheckpointException) as exc:
         rank_suffix = (
             f" on rank {dist.get_rank()}"
             if dist.is_available() and dist.is_initialized()
@@ -2536,6 +2536,12 @@ def merge_sharded_checkpoints(
         raise WeightedMergeError(
             f"Unsupported execution mode '{execution_mode}'. "
             f"Use one of: {', '.join(MERGE_EXECUTION_MODES)}."
+        )
+    if execution_mode == "direct-dcp-streaming" and not atomic_output:
+        raise WeightedMergeError(
+            "--merge-execution-mode=direct-dcp-streaming requires atomic output "
+            "publication; --no-atomic-merge-output is not supported because direct "
+            "DCP writes could otherwise expose a partial final checkpoint."
         )
     if byte_accounting not in BYTE_ACCOUNTING_MODES:
         raise WeightedMergeError(
@@ -3263,7 +3269,10 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument(
         "--no-atomic-merge-output",
         action="store_true",
-        help="Write directly to --merge-output instead of publishing from a temporary directory.",
+        help=(
+            "Write directly to --merge-output instead of publishing from a temporary "
+            "directory. Not supported with --merge-execution-mode=direct-dcp-streaming."
+        ),
     )
     group.add_argument(
         "--extra-state-source-index",

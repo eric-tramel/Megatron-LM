@@ -241,6 +241,11 @@ def _dcp_metadata_summary(path):
     }
 
 
+def _assert_no_direct_atomic_publication(output_root, output_iteration):
+    assert not (output_root / iteration_dir_name(output_iteration)).exists()
+    assert not (output_root / "latest_checkpointed_iteration.txt").exists()
+
+
 def _bytesio_state(value):
     data = io.BytesIO()
     torch.save({"value": value}, data)
@@ -1273,6 +1278,155 @@ def test_direct_dcp_streaming_bfloat16_save_dtype_and_chunk_metadata(
         assert weight_metadata.properties.dtype == torch.bfloat16
         assert len(weight_metadata.chunks) > 1
         assert all(chunk.sizes.numel() < torch.Size(shape).numel() for chunk in weight_metadata.chunks)
+
+
+def test_direct_dcp_streaming_rejects_no_atomic_output(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_no_atomic_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_no_atomic_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_no_atomic_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        with pytest.raises(
+            WeightedMergeError,
+            match="direct-dcp-streaming requires atomic output publication",
+        ):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                lambda: _template(),
+                output_iteration=30,
+                execution_mode="direct-dcp-streaming",
+                atomic_output=False,
+                streaming_chunk_bytes=16,
+            )
+
+        _assert_no_direct_atomic_publication(output_root, 30)
+
+
+def test_direct_dcp_streaming_planner_failure_does_not_publish_final_output(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    resolve_calls = []
+
+    def fail_resolve_data(self, write_item):
+        resolve_calls.append(write_item)
+        raise RuntimeError("injected direct planner failure")
+
+    monkeypatch.setattr(
+        weighted_merge_module._WeightedMergeDirectOutputSavePlanner,
+        "resolve_data",
+        fail_resolve_data,
+    )
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_plan_fail_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_plan_fail_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_plan_fail_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        with pytest.raises(WeightedMergeError, match="Direct DCP streaming save failed"):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                lambda: _template(),
+                output_iteration=30,
+                execution_mode="direct-dcp-streaming",
+                streaming_chunk_bytes=16,
+            )
+
+        assert resolve_calls
+        _assert_no_direct_atomic_publication(output_root, 30)
+        temporary_dirs = list(output_root.glob(".iter_0000030.tmp-*"))
+        assert len(temporary_dirs) == 1
+        assert not (temporary_dirs[0] / "metadata.json").exists()
+
+
+@pytest.mark.parametrize("failing_sidecar", ("save_common", "save_config"))
+def test_direct_dcp_streaming_sidecar_failure_after_dcp_save_does_not_publish_final_output(
+    tmp_path_dist_ckpt, process_group, monkeypatch, failing_sidecar
+):
+    if failing_sidecar == "save_common":
+        from megatron.core.dist_checkpointing.strategies import common as sidecar_module
+    else:
+        from megatron.core.dist_checkpointing import core as sidecar_module
+
+    def fail_sidecar(*_args, **_kwargs):
+        raise RuntimeError(f"injected {failing_sidecar} failure")
+
+    monkeypatch.setattr(sidecar_module, failing_sidecar, fail_sidecar)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / f"weighted_merge_direct_{failing_sidecar}_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / f"weighted_merge_direct_{failing_sidecar}_b") as ckpt_b,
+        TempNamedDir(
+            tmp_path_dist_ckpt / f"weighted_merge_direct_{failing_sidecar}_out"
+        ) as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        with pytest.raises(
+            (RuntimeError, WeightedMergeError),
+            match=f"injected {failing_sidecar} failure",
+        ):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                lambda: _template(),
+                output_iteration=30,
+                execution_mode="direct-dcp-streaming",
+                streaming_chunk_bytes=16,
+            )
+
+        _assert_no_direct_atomic_publication(output_root, 30)
+        temporary_dirs = list(output_root.glob(".iter_0000030.tmp-*"))
+        assert len(temporary_dirs) == 1
+        torch_dcp.FileSystemReader(temporary_dirs[0]).read_metadata()
+        assert not (temporary_dirs[0] / "metadata.json").exists()
+
+
+def test_direct_dcp_streaming_latest_marker_failure_is_after_publication(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    real_replace = weighted_merge_module.os.replace
+
+    def fail_latest_marker_replace(src, dst):
+        if Path(dst).name == "latest_checkpointed_iteration.txt":
+            raise OSError("injected latest marker failure")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(weighted_merge_module.os, "replace", fail_latest_marker_replace)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_marker_fail_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_marker_fail_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_marker_fail_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        with pytest.raises(OSError, match="injected latest marker failure"):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                lambda: _template(),
+                output_iteration=30,
+                execution_mode="direct-dcp-streaming",
+                streaming_chunk_bytes=16,
+            )
+
+        final_dir = output_root / "iter_0000030"
+        assert final_dir.exists()
+        torch_dcp.FileSystemReader(final_dir).read_metadata()
+        assert not (output_root / "latest_checkpointed_iteration.txt").exists()
 
 
 def test_direct_dcp_streaming_two_rank_product_round_trip_public_metadata(

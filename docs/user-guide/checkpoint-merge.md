@@ -161,10 +161,18 @@ Current product-level two-rank CPU/gloo coverage passes for ordinary
 DCP metadata and storage records, rank-distinct public DCP readback, Megatron
 rank-local readback, rank-0 `common.pt` and `metadata.json` sidecars,
 `latest_checkpointed_iteration.txt`, and invariance against
-`file-backed-streaming` for the tested fixture. The focused direct subset reports
-`6 passed, 77 deselected, 30 warnings`; the two-rank `torchrun` row reports
-`1 passed, 82 deselected, 28 warnings` per rank; the full weighted-merge unit
-module reports `82 passed, 1 skipped, 88 warnings`.
+`file-backed-streaming` for the tested fixture. That distributed direct-output
+evidence from commit `d27c9937e` reported `1 passed, 82 deselected, 28 warnings`
+per rank for the product two-rank row. The current failure-hardening evidence
+adds focused failure tests reporting `5 passed, 83 deselected, 33 warnings`, a
+two-rank sidecar failure row reporting `2 passed, 86 deselected, 27 warnings`
+per rank, a broader direct-output subset reporting
+`11 passed, 77 deselected, 40 warnings`, and the full weighted-merge module
+reporting `87 passed, 1 skipped, 98 warnings`.
+
+Atomic publication is required for this mode. `direct-dcp-streaming` rejects
+`--no-atomic-merge-output` / `atomic_output=False` because direct DCP writes
+could otherwise expose a partial final checkpoint.
 
 This mode is output-bounded only for ordinary one-payload source checkpoints.
 Local source-read instrumentation showed that a 1 MiB logical request against a
@@ -175,6 +183,8 @@ lower-level reader that avoids full-payload deserialization. Broad layouts and
 model families, `ShardedTensorFactory` support, prepended-axis or
 flattened-range tensors, object `_extra_state` support, Super-scale RSS, and
 literal 1T+ proof are not validated by the current direct-output evidence. Hard
-rank death or process-group hangs still rely on launcher/process-group timeout.
-`--no-atomic-merge-output` and post-publication `--verify-load` remain outside
-stronger failure-atomic claims.
+rank death, process kill, filesystem crash, and process-group hangs still rely
+on launcher/process-group timeout or filesystem behavior and are not proven
+here. Overwrite replacement is best-effort exception rollback, not crash-atomic
+overwrite. Post-publication `--verify-load` is a smoke check, not a publication
+gate.
