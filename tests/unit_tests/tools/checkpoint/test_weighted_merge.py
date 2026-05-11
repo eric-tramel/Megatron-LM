@@ -2219,6 +2219,117 @@ def test_direct_dcp_streaming_sigkill_before_publish_does_not_expose_public_outp
     assert not (output_root / "latest_checkpointed_iteration.txt").exists()
 
 
+def test_direct_dcp_streaming_two_rank_sigkill_before_publish_is_bounded_and_hidden(tmp_path):
+    if not hasattr(os, "killpg") or not hasattr(os, "kill") or not hasattr(signal, "SIGKILL"):
+        pytest.skip("distributed hard-kill proof requires POSIX process groups")
+
+    output_root = tmp_path / "weighted_merge_direct_two_rank_sigkill_out"
+    sentinel_dir = tmp_path / "sentinels"
+    repo_root = Path(__file__).resolve().parents[4]
+    child_script_path = (
+        repo_root / "tests/unit_tests/tools/checkpoint/direct_output_rank_loss_repro.py"
+    )
+    stdout_path = tmp_path / "torchrun.stdout"
+    stderr_path = tmp_path / "torchrun.stderr"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONUNBUFFERED"] = "1"
+    env["WM_DIRECT_RANK_LOSS_OUTPUT_ROOT"] = str(output_root)
+    env["WM_DIRECT_RANK_LOSS_SENTINEL_DIR"] = str(sentinel_dir)
+    env.setdefault("GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nnodes=1",
+            "--nproc_per_node=2",
+            "--master-addr=127.0.0.1",
+            f"--master-port={_unused_tcp_port()}",
+            str(child_script_path),
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=stdout_path.open("w", encoding="utf-8"),
+        stderr=stderr_path.open("w", encoding="utf-8"),
+        text=True,
+        start_new_session=True,
+    )
+
+    def child_logs():
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        return stdout, stderr
+
+    def kill_child_group():
+        for pid_path in sentinel_dir.glob("rank*.pid"):
+            try:
+                os.kill(int(pid_path.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (FileNotFoundError, ProcessLookupError, ValueError):
+                pass
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    try:
+        prepublish_markers = [
+            sentinel_dir / "rank0.before_publish",
+            sentinel_dir / "rank1.before_publish",
+        ]
+        pid_files = [sentinel_dir / "rank0.pid", sentinel_dir / "rank1.pid"]
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not all(path.exists() for path in prepublish_markers):
+            if process.poll() is not None:
+                stdout, stderr = child_logs()
+                pytest.fail(
+                    "two-rank child exited before both ranks reached the pre-publish kill point\n"
+                    f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}"
+                )
+            time.sleep(0.05)
+
+        if not all(path.exists() for path in prepublish_markers):
+            kill_child_group()
+            process.wait(timeout=10)
+            stdout, stderr = child_logs()
+            pytest.fail(
+                "two-rank child did not reach the pre-publish kill point before timeout\n"
+                f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}"
+            )
+        assert all(path.exists() for path in pid_files)
+
+        rank1_pid = int((sentinel_dir / "rank1.pid").read_text(encoding="utf-8").strip())
+        os.kill(rank1_pid, signal.SIGKILL)
+
+        launcher_exited_after_rank_loss = True
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            launcher_exited_after_rank_loss = False
+            kill_child_group()
+            process.wait(timeout=10)
+
+        stdout, stderr = child_logs()
+        assert process.returncode != 0, f"stdout={stdout}\nstderr={stderr}"
+        assert process.returncode is not None
+        assert not launcher_exited_after_rank_loss or process.returncode != 0
+
+        temporary_dirs = {
+            Path(path.read_text(encoding="utf-8").strip()) for path in prepublish_markers
+        }
+        assert len(temporary_dirs) == 1
+        temporary_dir = temporary_dirs.pop()
+        assert temporary_dir.exists(), f"stdout={stdout}\nstderr={stderr}"
+        torch_dcp.FileSystemReader(temporary_dir).read_metadata()
+        assert (temporary_dir / "metadata.json").exists()
+        assert (temporary_dir / "common.pt").exists()
+        assert not (output_root / "iter_0000030").exists()
+        assert not (output_root / "latest_checkpointed_iteration.txt").exists()
+    finally:
+        kill_child_group()
+
+
 def test_direct_dcp_streaming_latest_marker_failure_is_after_publication(
     tmp_path_dist_ckpt, process_group, monkeypatch
 ):
