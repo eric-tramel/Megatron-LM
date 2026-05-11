@@ -1444,6 +1444,32 @@ def _save_strategy_from_source_metadata(
     return save_strategy
 
 
+def _report_save_metadata_cache_reuse(
+    save_strategy: Optional[TorchDistSaveShardedStrategy], *, requested: bool
+) -> bool:
+    """Report whether DCP accepted seeded source metadata for save planning."""
+
+    if not requested:
+        return False
+
+    save_metadata_cache_reused = bool(
+        save_strategy is not None
+        and getattr(save_strategy, "validated_loaded_metadata_reuse", False)
+    )
+    if save_metadata_cache_reused:
+        print_rank_0("DCP save metadata cache reuse: reused source metadata", flush=True)
+    elif save_strategy is None:
+        print_rank_0("DCP save metadata cache reuse: not reused", flush=True)
+    else:
+        print_rank_0(
+            "DCP save metadata cache reuse: not reused; source metadata was seeded, "
+            "but DCP did not validate loaded metadata reuse, so the save fell back to "
+            "metadata generated during save planning.",
+            flush=True,
+        )
+    return save_metadata_cache_reused
+
+
 def _streaming_work_groups(
     work_items: list[_StreamingWorkItem], streaming_chunk_bytes: int
 ) -> list[list[_StreamingWorkItem]]:
@@ -2377,16 +2403,9 @@ def merge_sharded_checkpoints(
         sharded_strategy=save_strategy,
         validate_access_integrity=validate_access_integrity,
     )
-    save_metadata_cache_reused = bool(
-        save_strategy is not None
-        and getattr(save_strategy, "validated_loaded_metadata_reuse", False)
+    save_metadata_cache_reused = _report_save_metadata_cache_reuse(
+        save_strategy, requested=reuse_source_metadata_for_save
     )
-    if reuse_source_metadata_for_save:
-        print_rank_0(
-            "DCP save metadata cache reuse: "
-            f"{'reused source metadata' if save_metadata_cache_reused else 'not reused'}",
-            flush=True,
-        )
     if dist.is_initialized():
         dist.barrier()
     if atomic_output:

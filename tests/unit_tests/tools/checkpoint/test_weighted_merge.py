@@ -354,6 +354,21 @@ def test_save_strategy_from_source_metadata_falls_back_without_cuda(monkeypatch)
     )
 
 
+def test_save_metadata_cache_reuse_reports_seeded_dcp_rejection(capsys):
+    strategy = SimpleNamespace(validated_loaded_metadata_reuse=False)
+
+    assert (
+        weighted_merge_module._report_save_metadata_cache_reuse(strategy, requested=True)
+        is False
+    )
+
+    captured = capsys.readouterr()
+    assert "DCP save metadata cache reuse: not reused" in captured.out
+    assert "source metadata was seeded" in captured.out
+    assert "DCP did not validate loaded metadata reuse" in captured.out
+    assert "metadata generated during save planning" in captured.out
+
+
 def test_file_backed_per_tensor_staging_uses_exact_storage(tmp_path):
     shared_store = weighted_merge_module._FileBackedTensorStore(
         tmp_path / "shared",
