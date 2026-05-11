@@ -23,9 +23,9 @@ path for large model merging.
 
 The script still runs Megatron initialization to build the sharded state dict
 template, so launch it in a normal Megatron runtime with the required distributed
-and CUDA dependencies. `cpu-resident` and `file-backed-streaming` control merge
-tensor placement after template construction; they are not a CPU-only execution
-guarantee.
+and CUDA dependencies. `cpu-resident`, `file-backed-streaming`, and
+`direct-dcp-streaming` control merge tensor placement after template
+construction; they are not CPU-only execution guarantees.
 
 ## Manual Weighted Merge
 
@@ -139,3 +139,28 @@ output bytes written, effective read/write bandwidth, and per-rank peak host/GPU
 memory observed by the merge process. Cluster runtime metrics such as
 `/usr/bin/time -v`, `sacct`, or site telemetry should also be captured when
 building a performance table for a PR.
+
+## Experimental Direct DCP Streaming
+
+`--merge-execution-mode=direct-dcp-streaming` is an experimental, guarded
+single-rank `torch_dist` prototype. It streams fp32-accumulated output chunks
+directly into PyTorch DCP storage and publishes DCP metadata for those chunks,
+avoiding the file-backed full-output staging tensor used by
+`file-backed-streaming` in local tests.
+
+Use this mode only as an opt-in experiment. It currently requires private
+PyTorch DCP filesystem APIs and rejects merge-time world sizes greater than one.
+It supports ordinary `ShardedTensor` leaves in the tested local fixtures, copies
+tensor `_extra_state` entries from the selected source checkpoint, and can be
+validated with `--verify-load`.
+
+This mode is output-bounded only for ordinary one-payload source checkpoints.
+Local source-read instrumentation showed that a 1 MiB logical request against a
+normal source tensor caused PyTorch DCP to deserialize the full 16 MiB stored
+payload before narrowing; a chunked-source layout loaded the 1 MiB source chunk.
+End-to-end bounded RSS therefore requires chunked source checkpoint storage or a
+lower-level reader that avoids full-payload deserialization. Multi-rank behavior,
+`ShardedTensorFactory` support, prepended-axis or flattened-range tensors, object
+`_extra_state` support, generated model-family coverage, and Super-scale RSS are
+also not validated. Use `file-backed-streaming` for those layouts until the
+direct writer is broadened and validated.

@@ -1,12 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import io
+import pickle
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as torch_dcp
 
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing import ShardedObject, ShardedTensor
@@ -1056,6 +1058,129 @@ def test_file_backed_streaming_same_dtype_matches_baseline_template_dtype(
         streaming_metadata = weighted_merge_module.load_sharded_metadata(str(streaming.output_dir))
         assert streaming_metadata["model.weight"].dtype == torch.float32
         assert streaming_metadata["model.bias"].dtype == torch.float32
+
+
+def test_direct_dcp_streaming_mode_round_trip_without_file_backed_staging(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    shape = (5, 2)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1, shape=shape)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=2, shape=shape)
+        staging_root = output_root / "staging"
+
+        def fail_file_backed_tensor(*_args, **_kwargs):
+            raise AssertionError("direct DCP streaming must not allocate file-backed staging")
+
+        monkeypatch.setattr(weighted_merge_module, "_file_backed_tensor", fail_file_backed_tensor)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            lambda: _template(shape=shape),
+            output_iteration=30,
+            execution_mode="direct-dcp-streaming",
+            streaming_chunk_bytes=16,
+            staging_dir=staging_root,
+            verify_load=True,
+        )
+
+        loaded = _load_checkpoint(result.output_dir, shape=shape)
+        assert result.output_dir == output_root / "iter_0000030"
+        assert result.implementation_mode == "direct-dcp-streaming"
+        assert result.verified_load
+        assert result.memory_estimate.file_backed_staging_bytes == 0
+        assert result.memory_estimate.file_backed_staging_files == 0
+        assert not staging_root.exists()
+        assert torch.allclose(loaded["model"]["weight"], torch.full(shape, 4.0))
+        assert torch.allclose(loaded["model"]["bias"], torch.full((2,), 5.0))
+        assert torch.equal(loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0]))
+        assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
+
+        common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
+        provenance = common_state["weighted_merge_provenance"]
+        assert provenance["implementation_mode"] == "direct-dcp-streaming"
+        assert provenance["weights"] == [0.25, 0.75]
+        assert provenance["output_iteration"] == 30
+        assert common_state["iteration"] == 30
+        assert common_state["args"].iteration == 30
+
+        dcp_loaded = {
+            "model.weight": torch.empty(shape, dtype=torch.float32),
+            "model.bias": torch.empty((2,), dtype=torch.float32),
+            "model.decoder.layers.0._extra_state": torch.empty((1,), dtype=torch.float32),
+        }
+        torch_dcp.load(dcp_loaded, checkpoint_id=str(result.output_dir), no_dist=True)
+        assert torch.equal(dcp_loaded["model.weight"], torch.full(shape, 4.0))
+        assert torch.equal(dcp_loaded["model.bias"], torch.full((2,), 5.0))
+        assert torch.equal(dcp_loaded["model.decoder.layers.0._extra_state"], torch.tensor([111.0]))
+
+
+def test_direct_dcp_streaming_bfloat16_save_dtype_and_chunk_metadata(
+    tmp_path_dist_ckpt, process_group
+):
+    shape = (5, 2)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_bf16_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_bf16_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_bf16_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, dtype=torch.float16, extra_value=111.0, iteration=1, shape=shape)
+        _write_checkpoint(ckpt_b, 5.0, dtype=torch.float16, extra_value=999.0, iteration=2, shape=shape)
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _template(dtype=torch.float16, shape=shape),
+            save_dtype="bfloat16",
+            execution_mode="direct-dcp-streaming",
+            streaming_chunk_bytes=16,
+            verify_load=True,
+        )
+
+        loaded = _load_checkpoint(result.output_dir, dtype=torch.bfloat16, shape=shape)
+        assert result.implementation_mode == "direct-dcp-streaming"
+        assert loaded["model"]["weight"].dtype == torch.bfloat16
+        assert loaded["model"]["bias"].dtype == torch.bfloat16
+        assert torch.equal(loaded["model"]["weight"], torch.full(shape, 4.0, dtype=torch.bfloat16))
+        assert torch.equal(loaded["model"]["bias"], torch.full((2,), 5.0, dtype=torch.bfloat16))
+
+        from torch.distributed.checkpoint.filesystem import _metadata_fn
+
+        with (result.output_dir / _metadata_fn).open("rb") as metadata_file:
+            dcp_metadata = pickle.load(metadata_file)
+        weight_metadata = dcp_metadata.state_dict_metadata["model.weight"]
+        assert weight_metadata.properties.dtype == torch.bfloat16
+        assert len(weight_metadata.chunks) > 1
+        assert all(chunk.sizes.numel() < torch.Size(shape).numel() for chunk in weight_metadata.chunks)
+
+
+def test_direct_dcp_streaming_fails_clear_for_unsupported_factory(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_factory_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_factory_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_factory_out") as output_root,
+    ):
+        _write_factory_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_factory_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        with pytest.raises(WeightedMergeError, match="ShardedTensorFactory"):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root / "merged",
+                lambda: _factory_template(),
+                execution_mode="direct-dcp-streaming",
+                streaming_chunk_bytes=16,
+            )
 
 
 def test_merge_rejects_existing_output_directory_by_default(tmp_path_dist_ckpt, process_group):
