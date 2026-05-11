@@ -21,11 +21,13 @@ model's sharded state dict. It does not gather a full production model on rank
 for small conversion tests and debugging, but should not be used as the primary
 path for large model merging.
 
-The script still runs Megatron initialization to build the sharded state dict
-template, so launch it in a normal Megatron runtime with the required distributed
-and CUDA dependencies. `cpu-resident`, `file-backed-streaming`, and
-`direct-dcp-streaming` control merge tensor placement after template
-construction; they are not CPU-only execution guarantees.
+The template-backed modes still run Megatron initialization to build the sharded
+state dict template, so launch them in a normal Megatron runtime with the
+required distributed and CUDA dependencies. `cpu-resident`,
+`file-backed-streaming`, and `direct-dcp-streaming` control merge tensor
+placement after template construction; they are not CPU-only execution
+guarantees. `dcp-metadata-same-layout` is the narrow exception: it skips
+Megatron model/template construction and uses public DCP metadata only.
 
 ## Manual Weighted Merge
 
@@ -139,6 +141,40 @@ output bytes written, effective read/write bandwidth, and per-rank peak host/GPU
 memory observed by the merge process. Cluster runtime metrics such as
 `/usr/bin/time -v`, `sacct`, or site telemetry should also be captured when
 building a performance table for a PR.
+
+## Experimental Metadata Same-Layout Merge
+
+`--merge-execution-mode=dcp-metadata-same-layout` is an experimental
+`torch_dist`-only path for strict same-layout model checkpoints. It does not
+build a Megatron model or call `sharded_state_dict()`. Instead, it reads public
+PyTorch DCP metadata, fabricates CPU `ShardedTensor` leaves for the recorded
+chunks, loads each input chunk through public DCP, averages floating tensors on
+CPU, and writes the output through public DCP.
+
+Use this mode only when every input checkpoint has the same model tensor key set,
+global shapes, DCP chunk offsets/sizes, and, for `--merge-save-dtype=same`,
+dtypes. The mode currently infers mergeable model tensors only from keys
+starting with `model.`, `model0.`, or `model1.`. It rejects non-model DCP tensor
+entries and non-tensor model metadata because it cannot infer a safe merge policy
+for optimizer state, RNG state, or object metadata. Tensor `_extra_state` entries
+are copied from `--extra-state-source-index`.
+
+This mode supports manual `PATH:WEIGHT` inputs and simple start/end checkpoint
+selection. It does not support token-window selection, `--verify-load`,
+`--merge-preflight-only`, file-backed staging options, template initialization
+options, source metadata save reuse, or `--no-atomic-merge-output`.
+
+Example:
+
+```bash
+python tools/checkpoint/weighted_merge.py \
+  --merge-execution-mode dcp-metadata-same-layout \
+  --merge-inputs \
+    /checkpoints/run_a/iter_0001000:0.25 \
+    /checkpoints/run_a/iter_0002000:0.75 \
+  --merge-output /checkpoints/merged/metadata_same_layout \
+  --output-iteration 2000
+```
 
 ## Experimental Direct DCP Streaming
 

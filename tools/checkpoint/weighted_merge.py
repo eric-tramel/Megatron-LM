@@ -40,6 +40,7 @@ from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
     MetadataIndex,
     TensorProperties,
+    TensorStorageMetadata,
 )
 from torch.distributed.checkpoint.planner import (
     SavePlan,
@@ -54,6 +55,7 @@ from megatron.core.dist_checkpointing.core import maybe_load_config
 from megatron.core.dist_checkpointing.mapping import (
     ShardedBase,
     ShardedStateDict,
+    ShardedTensor,
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
@@ -79,10 +81,13 @@ SAVE_DTYPE_MAP = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32
 VALID_MODIFIERS = ("reverse", "scramble")
 SUPPORTED_INPUT_BACKENDS = ("torch_dist",)
 MERGE_EXECUTION_MODES = ("baseline", "cpu-resident", "file-backed-streaming", "direct-dcp-streaming")
+METADATA_SAME_LAYOUT_MODE = "dcp-metadata-same-layout"
+CLI_MERGE_EXECUTION_MODES = (*MERGE_EXECUTION_MODES, METADATA_SAME_LAYOUT_MODE)
 MERGE_TEMPLATE_INIT_MODES = ("default", "cpu", "meta")
 BYTE_ACCOUNTING_MODES = ("none", "rank0", "all")
 RESOURCE_LOG_MODES = ("none", "rank0", "all")
 FILE_BACKED_STAGING_LAYOUTS = ("shared-dtype", "per-tensor")
+METADATA_SAME_LAYOUT_MODEL_PREFIXES = ("model.", "model0.", "model1.")
 
 
 class WeightedMergeError(ValueError):
@@ -198,6 +203,13 @@ class _DirectDcpWriteSpec:
     source_dtype: Optional[torch.dtype] = None
     source_shape: Optional[tuple[int, ...]] = None
     is_extra_state: bool = False
+
+
+@dataclass(frozen=True)
+class _DcpMetadataTensorLayout:
+    global_shape: tuple[int, ...]
+    dtype: torch.dtype
+    chunks: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]
 
 
 class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
@@ -1849,6 +1861,502 @@ def _build_direct_dcp_write_specs(
     return write_specs, merge_chunk_count
 
 
+def _metadata_same_layout_is_model_key(
+    fqn: str, model_key_prefixes: tuple[str, ...]
+) -> bool:
+    return any(fqn.startswith(prefix) for prefix in model_key_prefixes)
+
+
+def _metadata_same_layout_path(fqn: str) -> tuple[Union[str, int], ...]:
+    return tuple(fqn.split("."))
+
+
+def _metadata_same_layout_tensor_dtype(
+    fqn: str, metadata_entry: TensorStorageMetadata
+) -> torch.dtype:
+    dtype = getattr(getattr(metadata_entry, "properties", None), "dtype", None)
+    if not isinstance(dtype, torch.dtype):
+        raise WeightedMergeError(
+            f"DCP metadata for '{fqn}' does not expose a torch dtype."
+        )
+    return dtype
+
+
+def _metadata_same_layout_tensor_layout(
+    fqn: str, metadata_entry: TensorStorageMetadata
+) -> _DcpMetadataTensorLayout:
+    chunks = tuple(
+        (
+            tuple(int(offset) for offset in chunk.offsets),
+            tuple(int(size) for size in chunk.sizes),
+        )
+        for chunk in getattr(metadata_entry, "chunks", ()) or ()
+    )
+    if not chunks:
+        raise WeightedMergeError(f"DCP metadata for '{fqn}' has no tensor chunks.")
+    return _DcpMetadataTensorLayout(
+        global_shape=tuple(int(dim) for dim in metadata_entry.size),
+        dtype=_metadata_same_layout_tensor_dtype(fqn, metadata_entry),
+        chunks=chunks,
+    )
+
+
+def _read_public_dcp_tensor_metadata(
+    checkpoint_dir: Path, *, model_key_prefixes: tuple[str, ...]
+) -> dict[str, TensorStorageMetadata]:
+    try:
+        metadata = FileSystemReader(checkpoint_dir).read_metadata()
+    except (Exception, CheckpointException) as exc:
+        raise WeightedMergeError(
+            f"Could not read public DCP metadata from {checkpoint_dir}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    tensor_metadata: dict[str, TensorStorageMetadata] = {}
+    non_tensor_model_keys: list[str] = []
+    for fqn, metadata_entry in metadata.state_dict_metadata.items():
+        fqn = str(fqn)
+        if isinstance(metadata_entry, TensorStorageMetadata):
+            tensor_metadata[fqn] = metadata_entry
+        elif _metadata_same_layout_is_model_key(fqn, model_key_prefixes):
+            non_tensor_model_keys.append(fqn)
+
+    if non_tensor_model_keys:
+        sample = ", ".join(sorted(non_tensor_model_keys)[:5])
+        raise WeightedMergeError(
+            "metadata-same-layout currently supports tensor DCP entries only; "
+            f"found non-tensor model metadata in {checkpoint_dir}: {sample}."
+        )
+    return tensor_metadata
+
+
+def _metadata_same_layout_model_keys(
+    tensor_metadata: dict[str, TensorStorageMetadata],
+    *,
+    checkpoint_dir: Path,
+    model_key_prefixes: tuple[str, ...],
+) -> tuple[str, ...]:
+    unsupported = sorted(
+        fqn
+        for fqn in tensor_metadata
+        if not _metadata_same_layout_is_model_key(fqn, model_key_prefixes)
+    )
+    if unsupported:
+        sample = ", ".join(unsupported[:5])
+        raise WeightedMergeError(
+            "metadata-same-layout refuses to infer merge policy for non-model "
+            f"DCP tensor keys in {checkpoint_dir}: {sample}. "
+            f"Allowed prefixes are {model_key_prefixes}."
+        )
+    model_keys = tuple(sorted(tensor_metadata))
+    if not model_keys:
+        raise WeightedMergeError(
+            f"metadata-same-layout found no model tensor keys in {checkpoint_dir}."
+        )
+    return model_keys
+
+
+def _validate_metadata_same_layout(
+    *,
+    tensor_metadata_by_checkpoint: list[dict[str, TensorStorageMetadata]],
+    resolved_input_dirs: list[Path],
+    model_key_prefixes: tuple[str, ...],
+    save_dtype: str,
+) -> tuple[tuple[str, ...], dict[str, _DcpMetadataTensorLayout]]:
+    first_keys = _metadata_same_layout_model_keys(
+        tensor_metadata_by_checkpoint[0],
+        checkpoint_dir=resolved_input_dirs[0],
+        model_key_prefixes=model_key_prefixes,
+    )
+    expected_key_set = set(first_keys)
+    for checkpoint_dir, tensor_metadata in zip(
+        resolved_input_dirs[1:], tensor_metadata_by_checkpoint[1:]
+    ):
+        model_keys = _metadata_same_layout_model_keys(
+            tensor_metadata,
+            checkpoint_dir=checkpoint_dir,
+            model_key_prefixes=model_key_prefixes,
+        )
+        key_set = set(model_keys)
+        if key_set != expected_key_set:
+            missing = sorted(expected_key_set - key_set)
+            unexpected = sorted(key_set - expected_key_set)
+            raise WeightedMergeError(
+                "metadata-same-layout requires identical model tensor key sets; "
+                f"{checkpoint_dir} is missing {missing[:5]} and has unexpected "
+                f"{unexpected[:5]}."
+            )
+
+    first_layouts = {
+        fqn: _metadata_same_layout_tensor_layout(
+            fqn, tensor_metadata_by_checkpoint[0][fqn]
+        )
+        for fqn in first_keys
+    }
+    for fqn in first_keys:
+        expected = first_layouts[fqn]
+        for checkpoint_dir, tensor_metadata in zip(
+            resolved_input_dirs[1:], tensor_metadata_by_checkpoint[1:]
+        ):
+            actual = _metadata_same_layout_tensor_layout(fqn, tensor_metadata[fqn])
+            if actual.global_shape != expected.global_shape:
+                raise WeightedMergeError(
+                    f"Shape mismatch for '{fqn}' in metadata-same-layout: "
+                    f"expected {expected.global_shape}, got {actual.global_shape} "
+                    f"in {checkpoint_dir}."
+                )
+            if actual.chunks != expected.chunks:
+                raise WeightedMergeError(
+                    f"Chunk layout mismatch for '{fqn}' in metadata-same-layout "
+                    f"for {checkpoint_dir}."
+                )
+            if save_dtype == "same" and actual.dtype != expected.dtype:
+                raise WeightedMergeError(
+                    f"Dtype mismatch for '{fqn}' with --merge-save-dtype=same: "
+                    f"expected {expected.dtype}, got {actual.dtype} in {checkpoint_dir}."
+                )
+
+    for fqn in first_keys:
+        if _is_extra_state(_metadata_same_layout_path(fqn), None):
+            continue
+        for checkpoint_dir, tensor_metadata in zip(
+            resolved_input_dirs, tensor_metadata_by_checkpoint
+        ):
+            dtype = _metadata_same_layout_tensor_dtype(fqn, tensor_metadata[fqn])
+            if not torch.empty((), dtype=dtype).is_floating_point():
+                raise WeightedMergeError(
+                    f"Checkpoint {checkpoint_dir} key '{fqn}' has non-floating dtype "
+                    f"{dtype}; weighted averaging is only supported for floating tensors."
+                )
+
+    return first_keys, first_layouts
+
+
+def _metadata_same_layout_chunk_leaf(
+    *,
+    fqn: str,
+    dtype: torch.dtype,
+    global_shape: tuple[int, ...],
+    global_offsets: tuple[int, ...],
+    chunk_shape: tuple[int, ...],
+) -> ShardedTensor:
+    return ShardedTensor(
+        key=fqn,
+        data=torch.empty(chunk_shape, dtype=dtype, device="cpu"),
+        dtype=dtype,
+        local_shape=chunk_shape,
+        global_shape=global_shape,
+        global_offset=global_offsets,
+        axis_fragmentations=None,
+        replica_id=0,
+    )
+
+
+def _build_metadata_same_layout_write_specs(
+    *,
+    selected_keys: tuple[str, ...],
+    first_layouts: dict[str, _DcpMetadataTensorLayout],
+    save_dtype: str,
+) -> tuple[list[_DirectDcpWriteSpec], int, int]:
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    world_size = (
+        dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    )
+    target_dtype_override = SAVE_DTYPE_MAP.get(save_dtype)
+    write_specs: list[_DirectDcpWriteSpec] = []
+    merge_keys = 0
+    extra_state_keys = 0
+
+    for fqn in selected_keys:
+        layout = first_layouts[fqn]
+        path = _metadata_same_layout_path(fqn)
+        is_extra_state = _is_extra_state(path, None)
+        if is_extra_state:
+            extra_state_keys += 1
+            target_dtype = layout.dtype
+        else:
+            merge_keys += 1
+            target_dtype = (
+                target_dtype_override if target_dtype_override is not None else layout.dtype
+            )
+        for chunk_index, (global_offsets, chunk_shape) in enumerate(layout.chunks):
+            if chunk_index % world_size != rank:
+                continue
+            template_leaf = _metadata_same_layout_chunk_leaf(
+                fqn=fqn,
+                dtype=layout.dtype,
+                global_shape=layout.global_shape,
+                global_offsets=global_offsets,
+                chunk_shape=chunk_shape,
+            )
+            write_specs.append(
+                _DirectDcpWriteSpec(
+                    path=path,
+                    template_leaf=template_leaf,
+                    sharded_key=fqn,
+                    global_shape=layout.global_shape,
+                    global_offsets=global_offsets,
+                    chunk_shape=chunk_shape,
+                    target_dtype=target_dtype,
+                    chunk_dim=-1,
+                    chunk_start=0,
+                    chunk_length=1,
+                    source_dtype=layout.dtype,
+                    source_shape=layout.global_shape,
+                    is_extra_state=is_extra_state,
+                )
+            )
+
+    if merge_keys == 0:
+        raise WeightedMergeError(
+            "metadata-same-layout found no mergeable non-_extra_state model tensors."
+        )
+    return write_specs, merge_keys, extra_state_keys
+
+
+def merge_same_layout_dcp_metadata_checkpoints(
+    input_paths: list[Union[str, Path]],
+    weights: list[float],
+    output_root: Union[str, Path],
+    *,
+    normalize: bool = False,
+    save_dtype: str = "same",
+    output_iteration: Optional[int] = None,
+    write_latest: bool = True,
+    extra_state_source_index: int = 0,
+    byte_accounting: str = "rank0",
+    overwrite_output: bool = False,
+    atomic_output: bool = True,
+    merge_style: Optional[str] = None,
+    model_key_prefixes: tuple[str, ...] = METADATA_SAME_LAYOUT_MODEL_PREFIXES,
+) -> MergeResult:
+    """Merge same-layout torch_dist checkpoints using public DCP metadata only."""
+
+    total_start = time.perf_counter()
+    discovery_start = time.perf_counter()
+    ensure_process_group()
+
+    if len(input_paths) != len(weights):
+        raise WeightedMergeError(f"Got {len(input_paths)} input paths but {len(weights)} weights.")
+    if not input_paths:
+        raise WeightedMergeError("At least one input checkpoint is required.")
+    if save_dtype != "same" and save_dtype not in SAVE_DTYPE_MAP:
+        raise WeightedMergeError(
+            f"Unsupported save dtype '{save_dtype}'. Use same, float32, float16, or bfloat16."
+        )
+    if byte_accounting not in BYTE_ACCOUNTING_MODES:
+        raise WeightedMergeError(
+            f"Unsupported byte accounting mode '{byte_accounting}'. "
+            f"Use one of: {', '.join(BYTE_ACCOUNTING_MODES)}."
+        )
+    if extra_state_source_index < 0 or extra_state_source_index >= len(input_paths):
+        raise WeightedMergeError(
+            f"extra_state_source_index {extra_state_source_index} is out of range."
+        )
+    if not model_key_prefixes:
+        raise WeightedMergeError("model_key_prefixes must contain at least one prefix.")
+    if not atomic_output:
+        raise WeightedMergeError(
+            f"--merge-execution-mode={METADATA_SAME_LAYOUT_MODE} requires atomic output "
+            "publication; --no-atomic-merge-output is not supported because public "
+            "DCP writes could otherwise expose a partial final checkpoint."
+        )
+
+    resolved_input_dirs = [resolve_checkpoint_dir(path) for path in input_paths]
+    input_formats = [_checkpoint_format(path) for path in resolved_input_dirs]
+    first_format = input_formats[0]
+    for checkpoint_dir, checkpoint_format in zip(resolved_input_dirs[1:], input_formats[1:]):
+        if checkpoint_format != first_format:
+            raise WeightedMergeError(
+                f"Checkpoint format mismatch: expected {first_format}, "
+                f"got {checkpoint_format} in {checkpoint_dir}."
+            )
+    if first_format != "torch_dist":
+        raise WeightedMergeError(
+            "metadata-same-layout currently supports torch_dist checkpoints only; "
+            f"got {first_format}."
+        )
+
+    weights = normalize_weights(weights) if normalize else validate_weights(weights)
+    output_dir = output_checkpoint_dir(output_root, output_iteration)
+    if not atomic_output and output_dir.exists() and not overwrite_output:
+        raise WeightedMergeError(
+            f"Output directory already exists: {output_dir}. "
+            "Use --overwrite-merge-output to replace it."
+        )
+
+    tensor_metadata_by_checkpoint = [
+        _read_public_dcp_tensor_metadata(
+            checkpoint_dir, model_key_prefixes=model_key_prefixes
+        )
+        for checkpoint_dir in resolved_input_dirs
+    ]
+    selected_keys, first_layouts = _validate_metadata_same_layout(
+        tensor_metadata_by_checkpoint=tensor_metadata_by_checkpoint,
+        resolved_input_dirs=resolved_input_dirs,
+        model_key_prefixes=model_key_prefixes,
+        save_dtype=save_dtype,
+    )
+    write_specs, averaged_tensors, copied_extra_states = _build_metadata_same_layout_write_specs(
+        selected_keys=selected_keys,
+        first_layouts=first_layouts,
+        save_dtype=save_dtype,
+    )
+    memory_estimate = MergeMemoryEstimate(
+        mergeable_tensors=averaged_tensors,
+        extra_state_entries=copied_extra_states,
+        template_devices=("cpu",),
+    )
+    discovery_time = time.perf_counter() - discovery_start
+
+    print_rank_0(
+        f"Merging {len(resolved_input_dirs)} same-layout metadata checkpoints into "
+        f"{output_dir} with weights {weights}",
+        flush=True,
+    )
+
+    temporary_output_dir = (
+        _prepare_temporary_output_dir(output_dir, overwrite_output)
+        if atomic_output
+        else output_dir
+    )
+    if overwrite_output and not atomic_output and output_dir.exists():
+        _run_rank0_filesystem_op(
+            f"Removing existing output directory {output_dir}",
+            lambda: shutil.rmtree(output_dir),
+        )
+        if dist.is_initialized():
+            dist.barrier()
+
+    base_common_state = dist_checkpointing.load_common_state_dict(str(resolved_input_dirs[0]))
+    common_state = _prepare_common_state(base_common_state, output_iteration)
+    strict = StrictHandling.ASSUME_OK_UNEXPECTED
+    _add_merge_provenance(
+        common_state,
+        input_dirs=resolved_input_dirs,
+        weights=weights,
+        normalize=normalize,
+        save_dtype=save_dtype,
+        output_iteration=output_iteration,
+        extra_state_source_index=extra_state_source_index,
+        strict=strict,
+        execution_mode=METADATA_SAME_LAYOUT_MODE,
+        merge_style=merge_style,
+        file_backed_staging_layout="none",
+    )
+
+    from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
+    from megatron.core.dist_checkpointing.strategies.common import save_common
+
+    load_strategies = {
+        checkpoint_dir: TorchDistLoadShardedStrategy(cache_metadata=True)
+        for checkpoint_dir in resolved_input_dirs
+    }
+    planner = _WeightedMergeDirectOutputSavePlanner(
+        write_specs=write_specs,
+        resolved_input_dirs=resolved_input_dirs,
+        weights=weights,
+        load_strategies=load_strategies,
+        extra_state_source_index=extra_state_source_index,
+    )
+    writer = FileSystemWriter(
+        temporary_output_dir,
+        single_file_per_rank=True,
+        sync_files=True,
+        thread_count=1,
+        per_thread_copy_ahead=0,
+    )
+
+    save_start = time.perf_counter()
+    bytes_read = sum(
+        _directory_size_for_accounting(checkpoint_dir, byte_accounting)
+        for checkpoint_dir in resolved_input_dirs
+    )
+    try:
+        torch_dcp.save(
+            {},
+            storage_writer=writer,
+            planner=planner,
+            no_dist=_direct_dcp_save_uses_no_dist(),
+        )
+    except (Exception, CheckpointException) as exc:
+        rank_suffix = (
+            f" on rank {dist.get_rank()}"
+            if dist.is_available() and dist.is_initialized()
+            else ""
+        )
+        raise WeightedMergeError(
+            f"Metadata same-layout DCP save failed{rank_suffix}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    def write_sidecars() -> None:
+        save_common(common_state, str(temporary_output_dir))
+        save_config(CheckpointingConfig("torch_dist", 1), str(temporary_output_dir))
+
+    _run_rank0_filesystem_op("Writing metadata same-layout checkpoint sidecars", write_sidecars)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    if atomic_output:
+        _publish_temporary_output_dir(
+            temporary_output_dir, output_dir, overwrite_output=overwrite_output
+        )
+        if dist.is_initialized():
+            dist.barrier()
+    if output_iteration is not None and write_latest:
+        _run_rank0_filesystem_op(
+            f"Writing {LATEST_CHECKPOINTED_ITERATION}",
+            lambda: write_latest_checkpointed_iteration(output_dir, output_iteration),
+        )
+    if dist.is_initialized():
+        dist.barrier()
+
+    save_time = time.perf_counter() - save_start
+    bytes_written = _directory_size_for_accounting(output_dir, byte_accounting)
+    host_peak_bytes = _host_peak_memory_bytes()
+    gpu_peak_bytes = _gpu_peak_memory_bytes()
+    (
+        rank,
+        world_size,
+        max_host_peak_rank,
+        max_host_peak_bytes,
+        max_gpu_peak_rank,
+        max_gpu_peak_bytes,
+    ) = _distributed_memory_peaks(host_peak_bytes, gpu_peak_bytes)
+    timings = MergeTimings(
+        discovery=discovery_time,
+        load=planner.load_time,
+        accumulation=planner.accumulation_time,
+        save=save_time,
+        total=time.perf_counter() - total_start,
+    )
+    return MergeResult(
+        output_dir=output_dir,
+        input_dirs=tuple(resolved_input_dirs),
+        weights=tuple(weights),
+        timings=timings,
+        averaged_tensors=averaged_tensors,
+        copied_extra_states=copied_extra_states,
+        bytes_read=bytes_read,
+        bytes_written=bytes_written,
+        backend=first_format,
+        host_peak_bytes=host_peak_bytes,
+        gpu_peak_bytes=gpu_peak_bytes,
+        max_host_peak_bytes=max_host_peak_bytes,
+        max_host_peak_rank=max_host_peak_rank,
+        max_gpu_peak_bytes=max_gpu_peak_bytes,
+        max_gpu_peak_rank=max_gpu_peak_rank,
+        world_size=world_size,
+        rank=rank,
+        implementation_mode=METADATA_SAME_LAYOUT_MODE,
+        memory_estimate=memory_estimate,
+        file_backed_staging_layout="none",
+    )
+
+
 def _merge_direct_dcp_streaming(
     *,
     resolved_input_dirs: list[Path],
@@ -3144,7 +3652,7 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     group.add_argument(
         "--merge-execution-mode",
-        choices=MERGE_EXECUTION_MODES,
+        choices=CLI_MERGE_EXECUTION_MODES,
         default="baseline",
         help=(
             "Execution placement for DCP load/save tensors. 'cpu-resident' keeps loaded "
@@ -3154,7 +3662,10 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "'direct-dcp-streaming' writes output chunks directly with public DCP "
             "FileSystemWriter, using distributed DCP save when the process group has "
             "more than one rank, without file-backed full-output staging; source reads "
-            "still follow the source checkpoint storage-record layout."
+            "still follow the source checkpoint storage-record layout. "
+            f"'{METADATA_SAME_LAYOUT_MODE}' skips Megatron model/template construction "
+            "and merges strict same-layout torch_dist checkpoints using public DCP "
+            "metadata only."
         ),
     )
     group.add_argument(
@@ -3310,6 +3821,150 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Permit data-parallel merge-time world sizes above one. This is experimental.",
     )
     return parser
+
+
+def _resolve_cli_inputs_and_weights(
+    args: argparse.Namespace,
+    *,
+    seq_length: Optional[int] = None,
+    global_batch_size: Optional[int] = None,
+) -> tuple[list[Path], list[float], Optional[int], Optional[str]]:
+    use_selection_mode = args.start_checkpoint is not None or args.merge_window_btoks is not None
+    output_iteration = args.output_iteration
+
+    if use_selection_mode:
+        if len(args.merge_inputs) != 1:
+            raise WeightedMergeError("Range/window mode expects exactly one --merge-inputs root.")
+        if args.end_checkpoint is None:
+            raise WeightedMergeError("--end-checkpoint is required for range/window mode.")
+
+        checkpoint_root = Path(args.merge_inputs[0])
+        selected_iterations = select_checkpoints_in_window(
+            checkpoint_root,
+            start_iteration=args.start_checkpoint,
+            end_iteration=args.end_checkpoint,
+            token_window_btok=args.merge_window_btoks,
+            seq_length=seq_length,
+            global_batch_size=global_batch_size,
+            min_iteration_interval=args.min_iteration_interval,
+        )
+        coefficient_map = checkpoint_coefficients(
+            selected_iterations, args.merge_style, seed=args.coefficient_seed
+        )
+        input_paths = checkpoint_paths_for_iterations(checkpoint_root, selected_iterations)
+        weights = [coefficient_map[iteration] for iteration in selected_iterations]
+        if output_iteration is None:
+            output_iteration = args.end_checkpoint
+        merge_style = args.merge_style
+    else:
+        input_paths, weights = parse_weighted_inputs(args.merge_inputs)
+        merge_style = None
+        warn_manual_weight_policy(weights, normalize=args.normalize)
+
+    validate_min_checkpoints(len(input_paths), args.min_checkpoints)
+    return input_paths, weights, output_iteration, merge_style
+
+
+def _parse_metadata_same_layout_args(
+    argv: Optional[list[str]] = None,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Merge strict same-layout torch_dist checkpoints using public DCP "
+            "metadata without Megatron model/template initialization."
+        )
+    )
+    add_merge_args(parser)
+    parser.add_argument(
+        "--ckpt-format",
+        choices=("torch_dist",),
+        default="torch_dist",
+        help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args(argv)
+    _validate_metadata_same_layout_cli_args(args)
+    return args
+
+
+def _validate_metadata_same_layout_cli_args(args: argparse.Namespace) -> None:
+    if args.merge_execution_mode != METADATA_SAME_LAYOUT_MODE:
+        raise WeightedMergeError(
+            f"metadata same-layout standalone dispatch requires "
+            f"--merge-execution-mode={METADATA_SAME_LAYOUT_MODE}."
+        )
+    if args.merge_window_btoks is not None:
+        raise WeightedMergeError(
+            f"--merge-window-btoks is not supported with "
+            f"--merge-execution-mode={METADATA_SAME_LAYOUT_MODE}; use explicit "
+            "PATH:WEIGHT inputs or start/end checkpoint selection."
+        )
+    if args.verify_load:
+        raise WeightedMergeError(
+            f"--verify-load is not supported with "
+            f"--merge-execution-mode={METADATA_SAME_LAYOUT_MODE} because no "
+            "Megatron model template is built."
+        )
+    if args.merge_preflight_only:
+        raise WeightedMergeError(
+            f"--merge-preflight-only is not implemented for "
+            f"--merge-execution-mode={METADATA_SAME_LAYOUT_MODE}."
+        )
+    if args.merge_reuse_source_metadata_for_save:
+        raise WeightedMergeError(
+            "--merge-reuse-source-metadata-for-save is supported only by "
+            "--merge-execution-mode=file-backed-streaming."
+        )
+    if args.no_atomic_merge_output:
+        raise WeightedMergeError(
+            f"--merge-execution-mode={METADATA_SAME_LAYOUT_MODE} requires atomic "
+            "output publication; --no-atomic-merge-output is not supported."
+        )
+
+    unsupported_non_defaults = [
+        (args.merge_streaming_chunk_bytes != 128 * 1024 * 1024, "--merge-streaming-chunk-bytes"),
+        (args.merge_staging_dir is not None, "--merge-staging-dir"),
+        (
+            args.merge_file_backed_staging_layout != "shared-dtype",
+            "--merge-file-backed-staging-layout",
+        ),
+        (args.merge_resource_log != "none", "--merge-resource-log"),
+        (args.merge_max_projected_cpu_bytes is not None, "--merge-max-projected-cpu-bytes"),
+        (
+            args.merge_max_file_backed_staging_bytes is not None,
+            "--merge-max-file-backed-staging-bytes",
+        ),
+        (
+            args.merge_max_file_backed_staging_files is not None,
+            "--merge-max-file-backed-staging-files",
+        ),
+        (args.merge_template_init_mode != "default", "--merge-template-init-mode"),
+        (args.model_builder != "gpt", "--model-builder"),
+        (args.strict != StrictHandling.RAISE_UNEXPECTED.value, "--strict"),
+        (args.allow_data_parallel_merge, "--allow-data-parallel-merge"),
+    ]
+    unsupported = [flag for is_set, flag in unsupported_non_defaults if is_set]
+    if unsupported:
+        raise WeightedMergeError(
+            f"--merge-execution-mode={METADATA_SAME_LAYOUT_MODE} does not use "
+            f"template/file-backed options: {', '.join(unsupported)}."
+        )
+
+
+def _run_metadata_same_layout_cli(args: argparse.Namespace) -> MergeResult:
+    input_paths, weights, output_iteration, merge_style = _resolve_cli_inputs_and_weights(args)
+    return merge_same_layout_dcp_metadata_checkpoints(
+        input_paths,
+        weights,
+        args.merge_output,
+        normalize=args.normalize,
+        save_dtype=args.merge_save_dtype,
+        output_iteration=output_iteration,
+        extra_state_source_index=args.extra_state_source_index,
+        byte_accounting=args.merge_byte_accounting,
+        overwrite_output=args.overwrite_merge_output,
+        atomic_output=not args.no_atomic_merge_output,
+        merge_style=merge_style,
+    )
 
 
 def _build_model_state_dict_factory(
@@ -3471,114 +4126,7 @@ def _data_parallel_size_from_args(args: argparse.Namespace) -> int:
     return max(world_size // max(model_parallel_size, 1), 1)
 
 
-def main() -> None:
-    sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
-    sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
-
-    pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--merge-inputs", nargs="+")
-    pre_parser.add_argument("--start-checkpoint", type=int)
-    pre_parser.add_argument("--end-checkpoint", type=int)
-    pre_args, _ = pre_parser.parse_known_args()
-
-    help_requested = any(arg in ("-h", "--help") for arg in sys.argv[1:])
-    if pre_args.merge_inputs and not help_requested:
-        checkpoint_root, checkpoint_iteration = _determine_checkpoint_for_args(
-            pre_args.merge_inputs, pre_args.start_checkpoint, pre_args.end_checkpoint
-        )
-        if "--load" not in sys.argv:
-            sys.argv.extend(["--load", str(checkpoint_root)])
-        if checkpoint_iteration is not None and "--ckpt-step" not in sys.argv:
-            sys.argv.extend(["--ckpt-step", str(checkpoint_iteration)])
-        if "--use-checkpoint-args" not in sys.argv:
-            sys.argv.append("--use-checkpoint-args")
-
-    from megatron.training import get_args
-    from megatron.training.initialize import initialize_megatron
-
-    parse_and_validate_merge_args(
-        args_defaults={
-            "exit_on_missing_checkpoint": False,
-            "no_load_optim": True,
-            "no_load_rng": True,
-        },
-    )
-    initialize_megatron()
-    args = get_args()
-    data_parallel_size = _data_parallel_size_from_args(args)
-    if data_parallel_size != 1 and not args.allow_data_parallel_merge:
-        raise WeightedMergeError(
-            "Weighted merge currently requires data-parallel size 1 by default. "
-            f"Got data_parallel_size={data_parallel_size}; pass --allow-data-parallel-merge "
-            "only after validating replica read/write behavior for this run."
-        )
-    print_rank_0(f"Merge data_parallel_size={data_parallel_size}", flush=True)
-
-    model_init_start = time.perf_counter()
-    state_dict_factory = _build_model_state_dict_factory(
-        args.model_builder, args.merge_template_init_mode, args.merge_resource_log
-    )
-    model_init_time = time.perf_counter() - model_init_start
-    use_selection_mode = args.start_checkpoint is not None or args.merge_window_btoks is not None
-    output_iteration = args.output_iteration
-
-    if use_selection_mode:
-        if len(args.merge_inputs) != 1:
-            raise WeightedMergeError("Range/window mode expects exactly one --merge-inputs root.")
-        if args.end_checkpoint is None:
-            raise WeightedMergeError("--end-checkpoint is required for range/window mode.")
-
-        checkpoint_root = Path(args.merge_inputs[0])
-        selected_iterations = select_checkpoints_in_window(
-            checkpoint_root,
-            start_iteration=args.start_checkpoint,
-            end_iteration=args.end_checkpoint,
-            token_window_btok=args.merge_window_btoks,
-            seq_length=getattr(args, "seq_length", None),
-            global_batch_size=getattr(args, "global_batch_size", None),
-            min_iteration_interval=args.min_iteration_interval,
-        )
-        coefficient_map = checkpoint_coefficients(
-            selected_iterations, args.merge_style, seed=args.coefficient_seed
-        )
-        input_paths = checkpoint_paths_for_iterations(checkpoint_root, selected_iterations)
-        weights = [coefficient_map[iteration] for iteration in selected_iterations]
-        if output_iteration is None:
-            output_iteration = args.end_checkpoint
-        merge_style = args.merge_style
-    else:
-        input_paths, weights = parse_weighted_inputs(args.merge_inputs)
-        merge_style = None
-        warn_manual_weight_policy(weights, normalize=args.normalize)
-
-    validate_min_checkpoints(len(input_paths), args.min_checkpoints)
-    result = merge_sharded_checkpoints(
-        input_paths,
-        weights,
-        args.merge_output,
-        state_dict_factory,
-        normalize=args.normalize,
-        save_dtype=args.merge_save_dtype,
-        output_iteration=output_iteration,
-        model_init_time=model_init_time,
-        verify_load=args.verify_load,
-        strict=args.strict,
-        extra_state_source_index=args.extra_state_source_index,
-        execution_mode=args.merge_execution_mode,
-        byte_accounting=args.merge_byte_accounting,
-        overwrite_output=args.overwrite_merge_output,
-        atomic_output=not args.no_atomic_merge_output,
-        streaming_chunk_bytes=args.merge_streaming_chunk_bytes,
-        staging_dir=args.merge_staging_dir,
-        merge_style=merge_style,
-        resource_log=args.merge_resource_log,
-        max_projected_cpu_bytes=args.merge_max_projected_cpu_bytes,
-        max_file_backed_staging_bytes=args.merge_max_file_backed_staging_bytes,
-        max_file_backed_staging_files=args.merge_max_file_backed_staging_files,
-        reuse_source_metadata_for_save=args.merge_reuse_source_metadata_for_save,
-        file_backed_staging_layout=args.merge_file_backed_staging_layout,
-        preflight_only=args.merge_preflight_only,
-    )
+def _print_merge_result(result: MergeResult) -> None:
     if result.preflight_only:
         print_rank_0(
             "Merge preflight complete: "
@@ -3633,6 +4181,96 @@ def main() -> None:
         f"(rank {result.max_gpu_peak_rank}/{result.world_size})",
         flush=True,
     )
+
+
+def main() -> None:
+    sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
+    sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
+
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--merge-inputs", nargs="+")
+    pre_parser.add_argument("--start-checkpoint", type=int)
+    pre_parser.add_argument("--end-checkpoint", type=int)
+    pre_parser.add_argument("--merge-execution-mode", choices=CLI_MERGE_EXECUTION_MODES)
+    pre_args, _ = pre_parser.parse_known_args()
+
+    if pre_args.merge_execution_mode == METADATA_SAME_LAYOUT_MODE:
+        args = _parse_metadata_same_layout_args()
+        result = _run_metadata_same_layout_cli(args)
+        _print_merge_result(result)
+        return
+
+    help_requested = any(arg in ("-h", "--help") for arg in sys.argv[1:])
+    if pre_args.merge_inputs and not help_requested:
+        checkpoint_root, checkpoint_iteration = _determine_checkpoint_for_args(
+            pre_args.merge_inputs, pre_args.start_checkpoint, pre_args.end_checkpoint
+        )
+        if "--load" not in sys.argv:
+            sys.argv.extend(["--load", str(checkpoint_root)])
+        if checkpoint_iteration is not None and "--ckpt-step" not in sys.argv:
+            sys.argv.extend(["--ckpt-step", str(checkpoint_iteration)])
+        if "--use-checkpoint-args" not in sys.argv:
+            sys.argv.append("--use-checkpoint-args")
+
+    from megatron.training import get_args
+    from megatron.training.initialize import initialize_megatron
+
+    parse_and_validate_merge_args(
+        args_defaults={
+            "exit_on_missing_checkpoint": False,
+            "no_load_optim": True,
+            "no_load_rng": True,
+        },
+    )
+    initialize_megatron()
+    args = get_args()
+    data_parallel_size = _data_parallel_size_from_args(args)
+    if data_parallel_size != 1 and not args.allow_data_parallel_merge:
+        raise WeightedMergeError(
+            "Weighted merge currently requires data-parallel size 1 by default. "
+            f"Got data_parallel_size={data_parallel_size}; pass --allow-data-parallel-merge "
+            "only after validating replica read/write behavior for this run."
+        )
+    print_rank_0(f"Merge data_parallel_size={data_parallel_size}", flush=True)
+
+    model_init_start = time.perf_counter()
+    state_dict_factory = _build_model_state_dict_factory(
+        args.model_builder, args.merge_template_init_mode, args.merge_resource_log
+    )
+    model_init_time = time.perf_counter() - model_init_start
+    input_paths, weights, output_iteration, merge_style = _resolve_cli_inputs_and_weights(
+        args,
+        seq_length=getattr(args, "seq_length", None),
+        global_batch_size=getattr(args, "global_batch_size", None),
+    )
+    result = merge_sharded_checkpoints(
+        input_paths,
+        weights,
+        args.merge_output,
+        state_dict_factory,
+        normalize=args.normalize,
+        save_dtype=args.merge_save_dtype,
+        output_iteration=output_iteration,
+        model_init_time=model_init_time,
+        verify_load=args.verify_load,
+        strict=args.strict,
+        extra_state_source_index=args.extra_state_source_index,
+        execution_mode=args.merge_execution_mode,
+        byte_accounting=args.merge_byte_accounting,
+        overwrite_output=args.overwrite_merge_output,
+        atomic_output=not args.no_atomic_merge_output,
+        streaming_chunk_bytes=args.merge_streaming_chunk_bytes,
+        staging_dir=args.merge_staging_dir,
+        merge_style=merge_style,
+        resource_log=args.merge_resource_log,
+        max_projected_cpu_bytes=args.merge_max_projected_cpu_bytes,
+        max_file_backed_staging_bytes=args.merge_max_file_backed_staging_bytes,
+        max_file_backed_staging_files=args.merge_max_file_backed_staging_files,
+        reuse_source_metadata_for_save=args.merge_reuse_source_metadata_for_save,
+        file_backed_staging_layout=args.merge_file_backed_staging_layout,
+        preflight_only=args.merge_preflight_only,
+    )
+    _print_merge_result(result)
 
 
 if __name__ == "__main__":
