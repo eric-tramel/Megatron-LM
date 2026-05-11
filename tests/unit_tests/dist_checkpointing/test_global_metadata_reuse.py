@@ -1,10 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 
+import logging
 from unittest import mock
 
 import pytest
+from torch.distributed.checkpoint.planner import SavePlan
 
+from megatron.core.dist_checkpointing.strategies import state_dict_saver
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
@@ -14,6 +17,53 @@ from tests.unit_tests.dist_checkpointing import (
     setup_model_and_optimizer,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+class _FakeDistWrapper:
+    is_coordinator = True
+
+    def __init__(self, world_size):
+        self.world_size = world_size
+
+    def get_world_size(self):
+        return self.world_size
+
+
+def test_global_metadata_reuse_diagnostic_names_mismatched_save_plan_fields(
+    caplog, monkeypatch
+):
+    local_plan = SavePlan(items=['current-item'], planner_data={'rank': 0}, usable=True)
+    loaded_plan = SavePlan(items=['loaded-item'], planner_data={'rank': 1}, usable=False)
+
+    original_tensor = state_dict_saver.torch.tensor
+
+    def cpu_tensor(*args, **kwargs):
+        kwargs.pop('device', None)
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(state_dict_saver.torch, 'tensor', cpu_tensor)
+    monkeypatch.setattr(state_dict_saver.torch.distributed, 'all_reduce', lambda *_, **__: None)
+
+    with caplog.at_level(logging.WARNING, logger=state_dict_saver.logger.name):
+        assert not state_dict_saver.verify_global_md_reuse(
+            [loaded_plan], local_plan, rank=0, dist_wrapper=_FakeDistWrapper(world_size=1)
+        )
+
+    assert "loaded global metadata reuse rejected on rank 0" in caplog.text
+    assert "differing SavePlan fields: items, planner_data, usable" in caplog.text
+    assert "items count: local=1, loaded=1" in caplog.text
+
+
+def test_global_metadata_reuse_diagnostic_names_plan_count_guard(caplog):
+    local_plan = SavePlan(items=[])
+    loaded_plans = [SavePlan(items=[]), SavePlan(items=[])]
+
+    with caplog.at_level(logging.WARNING, logger=state_dict_saver.logger.name):
+        assert not state_dict_saver.verify_global_md_reuse(
+            loaded_plans, local_plan, rank=0, dist_wrapper=_FakeDistWrapper(world_size=1)
+        )
+
+    assert "loaded_all_plans count 2 does not match world size 1" in caplog.text
 
 
 class TestGlobalMetadataReuse:

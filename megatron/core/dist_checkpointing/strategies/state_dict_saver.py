@@ -2,6 +2,7 @@
 
 """ State dict saver for PyT Distributed format allowing asynchronous save. """
 
+from dataclasses import fields
 from logging import getLogger
 from time import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
@@ -21,7 +22,38 @@ if TYPE_CHECKING:
 
 logger = getLogger(__name__)
 
-from dataclasses import fields
+_REUSABLE_SAVE_PLAN_FIELDS_EXCLUDED = {'storage_data'}
+
+
+def _get_reuse_plan_differences(local_plan: SavePlan, loaded_plan: SavePlan) -> List[str]:
+    """Return SavePlan fields that would block loaded global metadata reuse."""
+    return [
+        f.name
+        for f in fields(local_plan)
+        if f.name not in _REUSABLE_SAVE_PLAN_FIELDS_EXCLUDED
+        and getattr(local_plan, f.name) != getattr(loaded_plan, f.name)
+    ]
+
+
+def _safe_len(value) -> Union[int, str]:
+    try:
+        return len(value)
+    except TypeError:
+        return "unknown"
+
+
+def _format_reuse_plan_differences(local_plan: SavePlan, loaded_plan: SavePlan) -> str:
+    differing_fields = _get_reuse_plan_differences(local_plan, loaded_plan)
+    if not differing_fields:
+        return "no reusable SavePlan field differences"
+
+    details = [f"differing SavePlan fields: {', '.join(differing_fields)}"]
+    if 'items' in differing_fields:
+        details.append(
+            f"items count: local={_safe_len(local_plan.items)}, "
+            f"loaded={_safe_len(loaded_plan.items)}"
+        )
+    return "; ".join(details)
 
 
 def _compare_dataclasses(obj1, obj2):
@@ -190,16 +222,18 @@ def verify_global_md_reuse(
         logger.debug("loaded global metadata reuse verification: no loaded plans passed")
 
     elif len(loaded_all_plans) == dist_wrapper.get_world_size():
-        local_verify_reuse = all(
-            getattr(local_plan, f.name) == getattr(loaded_all_plans[rank], f.name)
-            for f in fields(local_plan)
-            if f.name != 'storage_data'
-        )
+        loaded_plan = loaded_all_plans[rank]
+        reuse_plan_differences = _get_reuse_plan_differences(local_plan, loaded_plan)
+        local_verify_reuse = not reuse_plan_differences
 
         if not local_verify_reuse:
+            logger.warning(
+                f"loaded global metadata reuse rejected on rank {rank}: "
+                f"{_format_reuse_plan_differences(local_plan, loaded_plan)}"
+            )
             logger.debug(
                 f"local_verify_reuse is False: diffs -"
-                f" {_compare_dataclasses(local_plan, loaded_all_plans[rank])}"
+                f" {_compare_dataclasses(local_plan, loaded_plan)}"
             )
         all_results = torch.tensor([local_verify_reuse], dtype=torch.int, device='cuda')
         torch.distributed.all_reduce(all_results, op=torch.distributed.ReduceOp.MIN)
@@ -207,6 +241,12 @@ def verify_global_md_reuse(
         global_md_verify_reuse = all_results.item() == 1
     else:
         global_md_verify_reuse = False
+        if dist_wrapper.is_coordinator:
+            logger.warning(
+                "loaded global metadata reuse rejected: loaded_all_plans count "
+                f"{len(loaded_all_plans)} does not match world size "
+                f"{dist_wrapper.get_world_size()}"
+            )
     return global_md_verify_reuse
 
 
