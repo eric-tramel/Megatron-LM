@@ -167,26 +167,34 @@ def _write_generated_gpt_checkpoint(path, value):
     dist_checkpointing.save(_generated_gpt_model_state(value), str(path))
 
 
-def _unprefixed_gpt_like_model_state(value):
+UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY = "decoder.layers.0.mlp.linear_fc1._extra_state"
+
+
+def _unprefixed_gpt_like_model_state(value, *, rank_sharded=False):
+    rank_offsets = _rank_offsets() if rank_sharded else ()
     return {
         "decoder.final_layernorm.weight": ShardedTensor.from_rank_offsets(
             "decoder.final_layernorm.weight",
             torch.full((3,), value, dtype=torch.float32),
+            *rank_offsets,
             replica_id=0,
         ),
         "decoder.layers.0.mlp.linear_fc1.weight": ShardedTensor.from_rank_offsets(
             "decoder.layers.0.mlp.linear_fc1.weight",
             torch.full((2, 3), value + 1, dtype=torch.float32),
+            *rank_offsets,
             replica_id=0,
         ),
         "embedding.word_embeddings.weight": ShardedTensor.from_rank_offsets(
             "embedding.word_embeddings.weight",
             torch.full((4, 3), value + 2, dtype=torch.float32),
+            *rank_offsets,
             replica_id=0,
         ),
         "output_layer.weight": ShardedTensor.from_rank_offsets(
             "output_layer.weight",
             torch.full((4, 3), value + 3, dtype=torch.float32),
+            *rank_offsets,
             replica_id=0,
         ),
     }
@@ -196,11 +204,37 @@ def _write_unprefixed_gpt_like_checkpoint(path, value):
     dist_checkpointing.save(_unprefixed_gpt_like_model_state(value), str(path))
 
 
-def _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(path, value, extra_value):
-    state = _unprefixed_gpt_like_model_state(value)
-    state["decoder.layers.0.mlp.linear_fc1._extra_state"] = ShardedObject(
-        "decoder.layers.0.mlp.linear_fc1._extra_state",
+def _unprefixed_gpt_like_byte_extra_template(extra_value=0):
+    return {
+        UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY: ShardedObject(
+            UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY,
+            _bytesio_state(extra_value),
+            (_world_size(),),
+            (_rank(),),
+            replica_id=0,
+        )
+    }
+
+
+def _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(
+    path, value, extra_value, *, rank_sharded=False
+):
+    state = _unprefixed_gpt_like_model_state(value, rank_sharded=rank_sharded)
+    state[UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY] = ShardedObject(
+        UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY,
         _bytesio_state(extra_value),
+        (_world_size(),),
+        (_rank(),),
+        replica_id=0,
+    )
+    dist_checkpointing.save(state, str(path))
+
+
+def _write_unprefixed_gpt_like_checkpoint_with_outside_byte_extra_state(path, value):
+    state = _unprefixed_gpt_like_model_state(value)
+    state["optimizer._extra_state"] = ShardedObject(
+        "optimizer._extra_state",
+        _bytesio_state(123),
         (_world_size(),),
         (_rank(),),
         replica_id=0,
@@ -350,6 +384,22 @@ def _bytesio_state(value):
     torch.save({"value": value}, data)
     data.seek(0)
     return data
+
+
+def _decode_sharded_object_value(value):
+    if value is None:
+        return None
+    if not isinstance(value, io.BytesIO):
+        return value
+    value.seek(0)
+    payload = torch.load(value, weights_only=False)
+    if isinstance(payload, list):
+        assert len(payload) == 1
+        payload = payload[0]
+    if isinstance(payload, io.BytesIO):
+        payload.seek(0)
+        return torch.load(payload, weights_only=False)
+    return payload
 
 
 def _object_extra_template(extra_value=0):
@@ -1564,7 +1614,7 @@ def test_metadata_same_layout_unprefixed_gpt_model_tensor_roots_round_trip(
         assert torch.equal(public_state["output_layer.weight"], torch.full((4, 3), 7.0))
 
 
-def test_metadata_same_layout_rejects_unprefixed_byte_extra_state(
+def test_metadata_same_layout_copies_unprefixed_byte_extra_state_from_selected_source(
     tmp_path_dist_ckpt, process_group
 ):
     with (
@@ -1575,12 +1625,90 @@ def test_metadata_same_layout_rejects_unprefixed_byte_extra_state(
         _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(ckpt_a, 1.0, 111)
         _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(ckpt_b, 5.0, 999)
 
-        with pytest.raises(WeightedMergeError, match="byte/object _extra_state"):
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=51,
+            extra_state_source_index=1,
+        )
+
+        assert result.output_dir == output_root / "iter_0000051"
+        assert result.averaged_tensors == 4
+        assert result.copied_extra_states == 1
+
+        public_state = {
+            "decoder.final_layernorm.weight": torch.empty((3,), dtype=torch.float32),
+            "decoder.layers.0.mlp.linear_fc1.weight": torch.empty((2, 3), dtype=torch.float32),
+            "embedding.word_embeddings.weight": torch.empty((4, 3), dtype=torch.float32),
+            "output_layer.weight": torch.empty((4, 3), dtype=torch.float32),
+        }
+        torch_dcp.load(public_state, checkpoint_id=str(result.output_dir), no_dist=True)
+        assert torch.equal(public_state["decoder.final_layernorm.weight"], torch.full((3,), 4.0))
+        assert torch.equal(
+            public_state["decoder.layers.0.mlp.linear_fc1.weight"],
+            torch.full((2, 3), 5.0),
+        )
+        assert torch.equal(public_state["embedding.word_embeddings.weight"], torch.full((4, 3), 6.0))
+        assert torch.equal(public_state["output_layer.weight"], torch.full((4, 3), 7.0))
+
+        object_key = f"{UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY}/shard_0_1"
+        loaded = dist_checkpointing.load(
+            {object_key: ShardedObject.empty_from_unique_key(object_key)},
+            str(result.output_dir),
+            validate_access_integrity=False,
+        )
+        assert _decode_sharded_object_value(loaded[object_key]) == {"value": 999}
+
+        normal_loaded = dist_checkpointing.load(
+            _unprefixed_gpt_like_byte_extra_template(),
+            str(result.output_dir),
+        )
+        normal_extra_state = normal_loaded[UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY]
+        normal_extra_state.seek(0)
+        assert torch.load(normal_extra_state, weights_only=False) == {"value": 999}
+
+
+def test_metadata_same_layout_rejects_byte_objects_outside_model_roots(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_outside_bytes_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_outside_bytes_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_outside_bytes_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint_with_outside_byte_extra_state(ckpt_a, 1.0)
+        _write_unprefixed_gpt_like_checkpoint_with_outside_byte_extra_state(ckpt_b, 5.0)
+
+        with pytest.raises(WeightedMergeError, match="byte/object DCP entries outside model roots"):
             merge_same_layout_dcp_metadata_checkpoints(
                 [ckpt_a, ckpt_b],
                 [0.25, 0.75],
                 output_root,
-                output_iteration=51,
+                output_iteration=53,
+            )
+
+
+def test_metadata_same_layout_rejects_mismatched_byte_extra_state_keys(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_byte_mismatch_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_byte_mismatch_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_byte_mismatch_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(ckpt_a, 1.0, 111)
+        _write_unprefixed_gpt_like_checkpoint(ckpt_b, 5.0)
+
+        with pytest.raises(
+            WeightedMergeError,
+            match="identical byte/object _extra_state key sets",
+        ):
+            merge_same_layout_dcp_metadata_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                output_iteration=54,
             )
 
 
@@ -2209,6 +2337,104 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
             assert provenance["implementation_mode"] == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
             assert provenance["extra_state_source_index"] == 1
             assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
+            assert len(list(result.output_dir.glob("*.distcp"))) == 2
+
+
+def test_metadata_same_layout_two_rank_byte_extra_state_round_trip(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    if _world_size() != 2:
+        pytest.skip("two-rank metadata same-layout byte coverage requires torchrun --nproc_per_node=2")
+
+    def fail_model_path(*_args, **_kwargs):
+        raise AssertionError("metadata same-layout must not use model/template construction")
+
+    monkeypatch.setattr(weighted_merge_module, "_build_model_state_dict_factory", fail_model_path)
+    monkeypatch.setattr(weighted_merge_module, "_state_dict_for_execution_mode", fail_model_path)
+    monkeypatch.setattr(
+        weighted_merge_module.dist_checkpointing,
+        "load_tensors_metadata",
+        fail_model_path,
+    )
+
+    with (
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_metadata_two_rank_bytes_a", sync=True
+        ) as ckpt_a,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_metadata_two_rank_bytes_b", sync=True
+        ) as ckpt_b,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_metadata_two_rank_bytes_out", sync=True
+        ) as output_root,
+    ):
+        rank = _rank()
+        _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(
+            ckpt_a,
+            1.0 + rank,
+            111 + rank,
+            rank_sharded=True,
+        )
+        _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(
+            ckpt_b,
+            5.0 + (2 * rank),
+            999 + rank,
+            rank_sharded=True,
+        )
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=31,
+            extra_state_source_index=1,
+        )
+
+        load_template = _unprefixed_gpt_like_model_state(0.0, rank_sharded=True)
+        load_template.update(_unprefixed_gpt_like_byte_extra_template())
+        loaded = dist_checkpointing.load(load_template, str(result.output_dir))
+
+        assert result.output_dir == output_root / "iter_0000031"
+        assert result.averaged_tensors == 4
+        assert result.copied_extra_states == 2
+        expected_base = 4.0 + (1.75 * rank)
+        assert torch.equal(
+            loaded["decoder.final_layernorm.weight"],
+            torch.full((3,), expected_base),
+        )
+        assert torch.equal(
+            loaded["decoder.layers.0.mlp.linear_fc1.weight"],
+            torch.full((2, 3), expected_base + 1.0),
+        )
+        assert torch.equal(
+            loaded["embedding.word_embeddings.weight"],
+            torch.full((4, 3), expected_base + 2.0),
+        )
+        assert torch.equal(
+            loaded["output_layer.weight"],
+            torch.full((4, 3), expected_base + 3.0),
+        )
+        loaded_extra_state = loaded[UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY]
+        loaded_extra_state.seek(0)
+        assert torch.load(loaded_extra_state, weights_only=False) == {"value": 999 + rank}
+
+        metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+        byte_keys = sorted(
+            str(fqn)
+            for fqn, entry in metadata.state_dict_metadata.items()
+            if type(entry).__name__ == "BytesStorageMetadata"
+        )
+        assert byte_keys == [
+            f"{UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY}/shard_0_2",
+            f"{UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY}/shard_1_2",
+        ]
+        metadata_summary = _dcp_metadata_summary(result.output_dir)
+        assert not metadata_summary["duplicate_chunk_offsets"]
+        assert not metadata_summary["duplicate_storage_records"]
+        assert metadata_summary["storage_file_count"] == 2
+
+        if _rank() == 0:
+            assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "31"
             assert len(list(result.output_dir.glob("*.distcp"))) == 2
 
 

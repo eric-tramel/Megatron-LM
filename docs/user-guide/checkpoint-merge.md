@@ -152,14 +152,15 @@ chunks, loads each input chunk through public DCP, averages floating tensors on
 CPU, and writes the output through public DCP.
 
 Use this mode only when every input checkpoint has the same model tensor key set,
-global shapes, DCP chunk offsets/sizes, and, for `--merge-save-dtype=same`,
-dtypes. The mode infers mergeable model tensors from keys starting with
-`model.`, `model0.`, or `model1.`, and from unprefixed Megatron GPT model roots
-`decoder.`, `embedding.`, and `output_layer.`. It rejects other DCP tensor roots
-instead of guessing whether they are optimizer, RNG, or other non-model state.
-Tensor `_extra_state` entries are copied from `--extra-state-source-index`.
-Byte/object `_extra_state` entries are rejected in this metadata-only mode
-because the public metadata path cannot copy them without a checkpoint template.
+global shapes, DCP chunk offsets/sizes, byte/object `_extra_state` key set, and,
+for `--merge-save-dtype=same`, dtypes. The mode infers mergeable model tensors
+from keys starting with `model.`, `model0.`, or `model1.`, and from unprefixed
+Megatron GPT model roots `decoder.`, `embedding.`, and `output_layer.`. It
+rejects other DCP tensor roots instead of guessing whether they are optimizer,
+RNG, or other non-model state. Tensor `_extra_state` entries and byte/object
+`_extra_state` entries under supported model roots are copied from
+`--extra-state-source-index`. Other byte/object DCP entries outside supported
+model roots are rejected.
 
 This mode supports manual `PATH:WEIGHT` inputs and simple start/end checkpoint
 selection. It does not support token-window selection, `--verify-load`,

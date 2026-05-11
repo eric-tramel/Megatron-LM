@@ -11,6 +11,7 @@ copied from one source checkpoint instead of averaged.
 
 import argparse
 import copy
+import io
 import math
 import os
 import random
@@ -55,6 +56,7 @@ from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.core import maybe_load_config
 from megatron.core.dist_checkpointing.mapping import (
     ShardedBase,
+    ShardedObject,
     ShardedStateDict,
     ShardedTensor,
     ShardedTensorFactory,
@@ -214,6 +216,19 @@ class _DcpMetadataTensorLayout:
     chunks: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]
 
 
+@dataclass(frozen=True)
+class _DcpMetadataByteSpec:
+    fqn: str
+    path: tuple[Union[str, int], ...]
+    template_leaf: ShardedObject
+
+
+@dataclass(frozen=True)
+class _DcpMetadataSnapshot:
+    tensor_metadata: dict[str, TensorStorageMetadata]
+    byte_extra_state_keys: tuple[str, ...]
+
+
 class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
     """Public DCP planner that resolves exactly one merged output chunk per item."""
 
@@ -221,12 +236,14 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
         self,
         *,
         write_specs: list[_DirectDcpWriteSpec],
+        byte_specs: Optional[list[_DcpMetadataByteSpec]] = None,
         resolved_input_dirs: list[Path],
         weights: list[float],
         load_strategies: dict[Path, TorchDistLoadShardedStrategy],
         extra_state_source_index: int,
     ) -> None:
         self.write_specs = write_specs
+        self.byte_specs = byte_specs or []
         self.resolved_input_dirs = resolved_input_dirs
         self.weights = weights
         self.load_strategies = load_strategies
@@ -239,6 +256,7 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
             (spec.sharded_key, spec.global_offsets, spec.chunk_shape): spec
             for spec in write_specs
         }
+        self._byte_spec_by_fqn = {spec.fqn: spec for spec in self.byte_specs}
         self._plan = SavePlan([])
 
     def set_up_planner(
@@ -256,6 +274,7 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
             self._write_item(spec, index)
             for index, spec in enumerate(self.write_specs)
         ]
+        items.extend(self._byte_write_item(spec) for spec in self.byte_specs)
         self._plan = SavePlan(items)
         return self._plan
 
@@ -266,9 +285,13 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
         self._plan = new_plan
         return self._plan
 
-    def resolve_data(self, write_item: WriteItem) -> torch.Tensor:
+    def resolve_data(self, write_item: WriteItem) -> Union[torch.Tensor, io.BytesIO]:
+        if write_item.type == WriteItemType.BYTE_IO:
+            return self._resolve_byte_object(write_item)
         if write_item.type != WriteItemType.SHARD or write_item.tensor_data is None:
-            raise WeightedMergeError("direct-dcp-streaming emits only tensor shard write items.")
+            raise WeightedMergeError(
+                "direct-dcp-streaming emits only tensor shard or byte-object write items."
+            )
         chunk = write_item.tensor_data.chunk
         spec_key = (
             write_item.index.fqn,
@@ -307,6 +330,14 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
                 properties=TensorProperties.create_from_tensor(fake_tensor),
                 size=torch.Size(spec.global_shape),
             ),
+        )
+
+    @staticmethod
+    def _byte_write_item(spec: _DcpMetadataByteSpec) -> WriteItem:
+        return WriteItem(
+            index=MetadataIndex(spec.fqn),
+            type=WriteItemType.BYTE_IO,
+            tensor_data=None,
         )
 
     def _resolve_merged_chunk(self, spec: _DirectDcpWriteSpec) -> torch.Tensor:
@@ -378,6 +409,33 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
                 f"'{_path_label(spec.path, spec.template_leaf)}' loaded as {type(value).__name__}."
             )
         return tensor.detach().cpu().contiguous()
+
+    def _resolve_byte_object(self, write_item: WriteItem) -> io.BytesIO:
+        try:
+            spec = self._byte_spec_by_fqn[write_item.index.fqn]
+        except KeyError as exc:
+            raise WeightedMergeError(
+                "metadata-same-layout could not resolve public DCP byte-object write item "
+                f"for '{write_item.index.fqn}'."
+            ) from exc
+        load_start = time.perf_counter()
+        loaded = _load_tensor_path_group_fast(
+            self.resolved_input_dirs[self.extra_state_source_index],
+            [(spec.path, spec.template_leaf)],
+            self.load_strategies[self.resolved_input_dirs[self.extra_state_source_index]],
+        )
+        self.load_time += time.perf_counter() - load_start
+        value = loaded[spec.path]
+        if isinstance(value, io.BytesIO):
+            value = io.BytesIO(value.getvalue())
+        elif isinstance(value, (bytes, bytearray)):
+            value = io.BytesIO(value)
+        else:
+            value = copy.deepcopy(value)
+        serialized = io.BytesIO()
+        torch.save([value], serialized)
+        serialized.seek(0)
+        return serialized
 
 
 def is_rank_0() -> bool:
@@ -1915,9 +1973,9 @@ def _metadata_same_layout_tensor_layout(
     )
 
 
-def _read_public_dcp_tensor_metadata(
+def _read_public_dcp_metadata(
     checkpoint_dir: Path, *, model_key_prefixes: tuple[str, ...]
-) -> dict[str, TensorStorageMetadata]:
+) -> _DcpMetadataSnapshot:
     try:
         metadata = FileSystemReader(checkpoint_dir).read_metadata()
     except (Exception, CheckpointException) as exc:
@@ -1928,7 +1986,8 @@ def _read_public_dcp_tensor_metadata(
 
     tensor_metadata: dict[str, TensorStorageMetadata] = {}
     non_tensor_model_keys: list[str] = []
-    byte_extra_state_model_keys: list[str] = []
+    byte_extra_state_keys: list[str] = []
+    non_model_byte_keys: list[str] = []
     for fqn, metadata_entry in metadata.state_dict_metadata.items():
         fqn = str(fqn)
         if isinstance(metadata_entry, TensorStorageMetadata):
@@ -1937,17 +1996,18 @@ def _read_public_dcp_tensor_metadata(
             if isinstance(metadata_entry, BytesStorageMetadata) and (
                 _metadata_same_layout_is_extra_state_key(fqn)
             ):
-                byte_extra_state_model_keys.append(fqn)
+                byte_extra_state_keys.append(fqn)
             else:
                 non_tensor_model_keys.append(fqn)
+        elif isinstance(metadata_entry, BytesStorageMetadata):
+            non_model_byte_keys.append(fqn)
 
-    if byte_extra_state_model_keys:
-        sample = ", ".join(sorted(byte_extra_state_model_keys)[:5])
+    if non_model_byte_keys:
+        sample = ", ".join(sorted(non_model_byte_keys)[:5])
         raise WeightedMergeError(
-            "metadata-same-layout cannot copy byte/object _extra_state DCP entries "
-            "through the public metadata-only path; refusing to silently drop required "
-            f"model state in {checkpoint_dir}: {sample}. Use an execution mode that "
-            "builds a checkpoint template, or remove/convert byte _extra_state entries."
+            "metadata-same-layout refuses byte/object DCP entries outside model roots "
+            f"in {checkpoint_dir}: {sample}. Allowed prefixes are {model_key_prefixes}; "
+            f"allowed unprefixed roots are {METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS}."
         )
     if non_tensor_model_keys:
         sample = ", ".join(sorted(non_tensor_model_keys)[:5])
@@ -1955,7 +2015,10 @@ def _read_public_dcp_tensor_metadata(
             "metadata-same-layout currently supports tensor DCP entries only; "
             f"found non-tensor model metadata in {checkpoint_dir}: {sample}."
         )
-    return tensor_metadata
+    return _DcpMetadataSnapshot(
+        tensor_metadata=tensor_metadata,
+        byte_extra_state_keys=tuple(sorted(byte_extra_state_keys)),
+    )
 
 
 def _metadata_same_layout_model_keys(
@@ -1988,10 +2051,11 @@ def _metadata_same_layout_model_keys(
 def _validate_metadata_same_layout(
     *,
     tensor_metadata_by_checkpoint: list[dict[str, TensorStorageMetadata]],
+    byte_extra_state_keys_by_checkpoint: list[tuple[str, ...]],
     resolved_input_dirs: list[Path],
     model_key_prefixes: tuple[str, ...],
     save_dtype: str,
-) -> tuple[tuple[str, ...], dict[str, _DcpMetadataTensorLayout]]:
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, _DcpMetadataTensorLayout]]:
     first_keys = _metadata_same_layout_model_keys(
         tensor_metadata_by_checkpoint[0],
         checkpoint_dir=resolved_input_dirs[0],
@@ -2012,6 +2076,21 @@ def _validate_metadata_same_layout(
             unexpected = sorted(key_set - expected_key_set)
             raise WeightedMergeError(
                 "metadata-same-layout requires identical model tensor key sets; "
+                f"{checkpoint_dir} is missing {missing[:5]} and has unexpected "
+                f"{unexpected[:5]}."
+            )
+
+    first_byte_keys = byte_extra_state_keys_by_checkpoint[0]
+    expected_byte_key_set = set(first_byte_keys)
+    for checkpoint_dir, byte_extra_state_keys in zip(
+        resolved_input_dirs[1:], byte_extra_state_keys_by_checkpoint[1:]
+    ):
+        byte_key_set = set(byte_extra_state_keys)
+        if byte_key_set != expected_byte_key_set:
+            missing = sorted(expected_byte_key_set - byte_key_set)
+            unexpected = sorted(byte_key_set - expected_byte_key_set)
+            raise WeightedMergeError(
+                "metadata-same-layout requires identical byte/object _extra_state key sets; "
                 f"{checkpoint_dir} is missing {missing[:5]} and has unexpected "
                 f"{unexpected[:5]}."
             )
@@ -2058,7 +2137,7 @@ def _validate_metadata_same_layout(
                     f"{dtype}; weighted averaging is only supported for floating tensors."
                 )
 
-    return first_keys, first_layouts
+    return first_keys, first_byte_keys, first_layouts
 
 
 def _metadata_same_layout_chunk_leaf(
@@ -2084,15 +2163,17 @@ def _metadata_same_layout_chunk_leaf(
 def _build_metadata_same_layout_write_specs(
     *,
     selected_keys: tuple[str, ...],
+    byte_extra_state_keys: tuple[str, ...],
     first_layouts: dict[str, _DcpMetadataTensorLayout],
     save_dtype: str,
-) -> tuple[list[_DirectDcpWriteSpec], int, int]:
+) -> tuple[list[_DirectDcpWriteSpec], list[_DcpMetadataByteSpec], int, int]:
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     world_size = (
         dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
     )
     target_dtype_override = SAVE_DTYPE_MAP.get(save_dtype)
     write_specs: list[_DirectDcpWriteSpec] = []
+    byte_specs: list[_DcpMetadataByteSpec] = []
     merge_keys = 0
     extra_state_keys = 0
 
@@ -2136,11 +2217,24 @@ def _build_metadata_same_layout_write_specs(
                 )
             )
 
+    for byte_index, fqn in enumerate(byte_extra_state_keys):
+        extra_state_keys += 1
+        if byte_index % world_size != rank:
+            continue
+        template_leaf = ShardedObject.empty_from_unique_key(fqn)
+        byte_specs.append(
+            _DcpMetadataByteSpec(
+                fqn=fqn,
+                path=(fqn,),
+                template_leaf=template_leaf,
+            )
+        )
+
     if merge_keys == 0:
         raise WeightedMergeError(
             "metadata-same-layout found no mergeable non-_extra_state model tensors."
         )
-    return write_specs, merge_keys, extra_state_keys
+    return write_specs, byte_specs, merge_keys, extra_state_keys
 
 
 def merge_same_layout_dcp_metadata_checkpoints(
@@ -2214,22 +2308,32 @@ def merge_same_layout_dcp_metadata_checkpoints(
             "Use --overwrite-merge-output to replace it."
         )
 
-    tensor_metadata_by_checkpoint = [
-        _read_public_dcp_tensor_metadata(
+    metadata_snapshots = [
+        _read_public_dcp_metadata(
             checkpoint_dir, model_key_prefixes=model_key_prefixes
         )
         for checkpoint_dir in resolved_input_dirs
     ]
-    selected_keys, first_layouts = _validate_metadata_same_layout(
+    tensor_metadata_by_checkpoint = [
+        snapshot.tensor_metadata for snapshot in metadata_snapshots
+    ]
+    byte_extra_state_keys_by_checkpoint = [
+        snapshot.byte_extra_state_keys for snapshot in metadata_snapshots
+    ]
+    selected_keys, byte_extra_state_keys, first_layouts = _validate_metadata_same_layout(
         tensor_metadata_by_checkpoint=tensor_metadata_by_checkpoint,
+        byte_extra_state_keys_by_checkpoint=byte_extra_state_keys_by_checkpoint,
         resolved_input_dirs=resolved_input_dirs,
         model_key_prefixes=model_key_prefixes,
         save_dtype=save_dtype,
     )
-    write_specs, averaged_tensors, copied_extra_states = _build_metadata_same_layout_write_specs(
-        selected_keys=selected_keys,
-        first_layouts=first_layouts,
-        save_dtype=save_dtype,
+    write_specs, byte_specs, averaged_tensors, copied_extra_states = (
+        _build_metadata_same_layout_write_specs(
+            selected_keys=selected_keys,
+            byte_extra_state_keys=byte_extra_state_keys,
+            first_layouts=first_layouts,
+            save_dtype=save_dtype,
+        )
     )
     memory_estimate = MergeMemoryEstimate(
         mergeable_tensors=averaged_tensors,
@@ -2283,6 +2387,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
     }
     planner = _WeightedMergeDirectOutputSavePlanner(
         write_specs=write_specs,
+        byte_specs=byte_specs,
         resolved_input_dirs=resolved_input_dirs,
         weights=weights,
         load_strategies=load_strategies,
