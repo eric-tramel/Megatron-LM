@@ -1197,7 +1197,14 @@ def _publish_temporary_output_dir(
                 if not output_dir.exists() and backup_dir.exists():
                     backup_dir.rename(output_dir)
                 raise
-            shutil.rmtree(backup_dir)
+            try:
+                shutil.rmtree(backup_dir)
+            except Exception as exc:
+                print_rank_0(
+                    f"WARNING: Published merged checkpoint to {output_dir}, but failed to "
+                    f"remove overwritten checkpoint backup {backup_dir}: {exc}",
+                    flush=True,
+                )
             return
         temporary_dir.rename(output_dir)
 
@@ -1838,9 +1845,13 @@ def _build_direct_dcp_write_specs(
     tensor_metadata_by_checkpoint: list[dict[str, Any]],
     extra_state_source_index: int,
     streaming_chunk_bytes: int,
-) -> tuple[list[_DirectDcpWriteSpec], int]:
+) -> tuple[list[_DirectDcpWriteSpec], list[_DcpMetadataByteSpec], int]:
     write_specs: list[_DirectDcpWriteSpec] = []
+    byte_specs: list[_DcpMetadataByteSpec] = []
     merge_chunk_count = 0
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    byte_extra_state_index = 0
 
     for plan in tensor_plans:
         _validate_direct_dcp_plan(plan)
@@ -1897,9 +1908,21 @@ def _build_direct_dcp_write_specs(
             )
         template_tensor = _as_tensor(template_leaf)
         if template_tensor is None:
+            if isinstance(template_leaf, ShardedObject):
+                if byte_extra_state_index % world_size == rank:
+                    byte_specs.append(
+                        _DcpMetadataByteSpec(
+                            fqn=str(getattr(template_leaf, "unique_key", sharded_key)),
+                            path=path,
+                            template_leaf=template_leaf,
+                        )
+                    )
+                byte_extra_state_index += 1
+                continue
             raise WeightedMergeError(
-                "direct-dcp-streaming currently supports tensor _extra_state leaves only; "
-                f"'{_path_label(path, template_leaf)}' is {type(template_leaf).__name__}."
+                "direct-dcp-streaming currently supports tensor or ShardedObject "
+                f"_extra_state leaves only; '{_path_label(path, template_leaf)}' is "
+                f"{type(template_leaf).__name__}."
             )
         if sharded_key not in extra_metadata:
             raise WeightedMergeError(
@@ -1941,7 +1964,7 @@ def _build_direct_dcp_write_specs(
             )
         )
 
-    return write_specs, merge_chunk_count
+    return write_specs, byte_specs, merge_chunk_count
 
 
 def _metadata_same_layout_is_model_key(
@@ -2571,7 +2594,7 @@ def _merge_direct_dcp_streaming(
         )
         for tensor_index, path in enumerate(merge_paths)
     ]
-    write_specs, tensor_chunk_count = _build_direct_dcp_write_specs(
+    write_specs, byte_specs, tensor_chunk_count = _build_direct_dcp_write_specs(
         tensor_plans=tensor_plans,
         extra_paths=extra_paths,
         initial_template=initial_template,
@@ -2582,6 +2605,7 @@ def _merge_direct_dcp_streaming(
 
     planner = _WeightedMergeDirectOutputSavePlanner(
         write_specs=write_specs,
+        byte_specs=byte_specs,
         resolved_input_dirs=resolved_input_dirs,
         weights=weights,
         load_strategies=streaming_load_strategies,
@@ -2628,6 +2652,7 @@ def _merge_direct_dcp_streaming(
     print_rank_0(
         "Direct DCP streaming wrote "
         f"{len(tensor_plans)} tensors as {tensor_chunk_count} chunks with "
+        f"{len(byte_specs)} local byte-object extra states, "
         f"chunk_budget={_format_bytes(streaming_chunk_bytes)}, "
         f"max_resolved_output={_format_bytes(planner.max_resolved_output_tensor_bytes)}. "
         "Output writing uses public DCP FileSystemWriter; source read volume follows "

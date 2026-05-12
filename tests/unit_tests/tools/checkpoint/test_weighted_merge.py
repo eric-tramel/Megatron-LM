@@ -646,6 +646,91 @@ def test_publish_temporary_output_dir_requires_public_dcp_metadata(tmp_path):
     assert not output_dir.exists()
 
 
+def test_direct_dcp_streaming_overwrite_final_rename_failure_rolls_back_and_keeps_latest(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_overwrite_fail_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_overwrite_fail_b") as ckpt_b,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_direct_overwrite_fail_out"
+        ) as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2)
+        final_dir = output_root / "iter_0000030"
+        final_dir.mkdir()
+        _write_checkpoint(final_dir, 9.0, iteration=29)
+        write_latest_checkpointed_iteration(final_dir, 29)
+
+        real_rename = Path.rename
+
+        def fail_final_publish_rename(self, target):
+            target = Path(target)
+            if self.parent == output_root and self.name.startswith(".iter_0000030.tmp-"):
+                assert target == final_dir
+                raise OSError("injected final publish rename failure")
+            return real_rename(self, target)
+
+        monkeypatch.setattr(Path, "rename", fail_final_publish_rename)
+
+        with pytest.raises(OSError, match="injected final publish rename failure"):
+            merge_sharded_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                lambda: _template(),
+                output_iteration=30,
+                execution_mode="direct-dcp-streaming",
+                streaming_chunk_bytes=16,
+                overwrite_output=True,
+            )
+
+        restored = _load_checkpoint(final_dir)
+        torch.testing.assert_close(restored["model"]["weight"], torch.full((2, 2), 9.0))
+        assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "29"
+        assert not list(output_root.glob(".iter_0000030.old-*"))
+        temporary_dirs = list(output_root.glob(".iter_0000030.tmp-*"))
+        assert len(temporary_dirs) == 1
+        torch_dcp.FileSystemReader(temporary_dirs[0]).read_metadata()
+
+
+def test_publish_temporary_output_dir_overwrite_backup_cleanup_failure_is_nonfatal(
+    tmp_path_dist_ckpt, process_group, monkeypatch, capsys
+):
+    output_dir = tmp_path_dist_ckpt / "weighted_merge_publish_cleanup_fail_out"
+    temporary_dir = tmp_path_dist_ckpt / ".weighted_merge_publish_cleanup_fail_out.tmp-deadbeef"
+    output_dir.mkdir()
+    temporary_dir.mkdir()
+    _write_checkpoint(output_dir, 3.0, iteration=3)
+    _write_checkpoint(temporary_dir, 7.0, iteration=7)
+
+    real_rmtree = weighted_merge_module.shutil.rmtree
+
+    def fail_backup_cleanup(path, *args, **kwargs):
+        path = Path(path)
+        if path.parent == tmp_path_dist_ckpt and path.name.startswith(
+            ".weighted_merge_publish_cleanup_fail_out.old-"
+        ):
+            raise OSError("injected backup cleanup failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(weighted_merge_module.shutil, "rmtree", fail_backup_cleanup)
+
+    weighted_merge_module._publish_temporary_output_dir(
+        temporary_dir, output_dir, overwrite_output=True
+    )
+
+    published = _load_checkpoint(output_dir)
+    torch.testing.assert_close(published["model"]["weight"], torch.full((2, 2), 7.0))
+    assert not temporary_dir.exists()
+    backups = list(tmp_path_dist_ckpt.glob(".weighted_merge_publish_cleanup_fail_out.old-*"))
+    assert len(backups) == 1
+    backup_state = _load_checkpoint(backups[0])
+    torch.testing.assert_close(backup_state["model"]["weight"], torch.full((2, 2), 3.0))
+    assert "failed to remove overwritten checkpoint backup" in capsys.readouterr().out
+
+
 def test_file_backed_per_tensor_staging_uses_exact_storage(tmp_path):
     shared_store = weighted_merge_module._FileBackedTensorStore(
         tmp_path / "shared",
@@ -2177,109 +2262,49 @@ def test_direct_dcp_streaming_sigkill_before_publish_does_not_expose_public_outp
         pytest.skip("pre-publish hard-kill proof requires POSIX process groups")
 
     output_root = tmp_path / "weighted_merge_direct_sigkill_out"
-    sentinel = tmp_path / "before_publish.ready"
+    sentinel_dir = tmp_path / "sentinels"
     repo_root = Path(__file__).resolve().parents[4]
-    child_script = textwrap.dedent(
-        """
-        import os
-        import time
-        from pathlib import Path
-        from types import SimpleNamespace
-
-        import torch
-
-        from megatron.core import dist_checkpointing
-        from megatron.core.dist_checkpointing import ShardedTensor
-        from megatron.core.dist_checkpointing.strategies import filesystem_async
-        from tools.checkpoint import weighted_merge as wm
-
-        output_root = Path(%r)
-        sentinel = Path(%r)
-
-        if not torch.cuda.is_available():
-            torch.cuda.synchronize = lambda *args, **kwargs: None
-            torch.cuda.current_device = lambda: torch.device("cpu")
-            if not filesystem_async.HAVE_PSUTIL:
-                filesystem_async._process_memory = lambda: 0
-
-        def template(value=0.0, *, extra_value=0.0):
-            return {
-                "model": {
-                    "weight": ShardedTensor.from_rank_offsets(
-                        "model.weight",
-                        torch.full((2, 2), value, dtype=torch.float32),
-                        replica_id=0,
-                    ),
-                    "bias": ShardedTensor.from_rank_offsets(
-                        "model.bias",
-                        torch.full((2,), value + 1, dtype=torch.float32),
-                        replica_id=0,
-                    ),
-                    "decoder.layers.0._extra_state": ShardedTensor.from_rank_offsets(
-                        "model.decoder.layers.0._extra_state",
-                        torch.tensor([extra_value], dtype=torch.float32),
-                        replica_id=0,
-                    ),
-                }
-            }
-
-        def write_checkpoint(path, value, *, extra_value=0.0, iteration=0):
-            path.mkdir(parents=True, exist_ok=True)
-            state_dict = template(value, extra_value=extra_value)
-            state_dict["args"] = SimpleNamespace(iteration=iteration, hidden_size=2)
-            state_dict["checkpoint_version"] = 3.0
-            state_dict["iteration"] = iteration
-            dist_checkpointing.save(state_dict, str(path))
-
-        def block_before_publish(temporary_dir, output_dir, *, overwrite_output):
-            wm._require_publishable_checkpoint_dir(temporary_dir)
-            with sentinel.open("w", encoding="utf-8") as handle:
-                handle.write(str(temporary_dir))
-                handle.write("\\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            while True:
-                time.sleep(1)
-
-        wm._publish_temporary_output_dir = block_before_publish
-        output_root.mkdir(parents=True, exist_ok=True)
-        ckpt_a = output_root / "input_a"
-        ckpt_b = output_root / "input_b"
-
-        wm.ensure_process_group()
-        write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1)
-        write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=2)
-        wm.merge_sharded_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.25, 0.75],
-            output_root,
-            template,
-            output_iteration=30,
-            execution_mode="direct-dcp-streaming",
-            streaming_chunk_bytes=16,
-        )
-        """
-        % (str(output_root), str(sentinel))
+    child_script_path = (
+        repo_root / "tests/unit_tests/tools/checkpoint/direct_output_rank_loss_repro.py"
     )
+    stdout_path = tmp_path / "torchrun-one-rank.stdout"
+    stderr_path = tmp_path / "torchrun-one-rank.stderr"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
-    env["MASTER_ADDR"] = "127.0.0.1"
-    env["MASTER_PORT"] = _unused_tcp_port()
-    env["RANK"] = "0"
-    env["WORLD_SIZE"] = "1"
-    env["LOCAL_RANK"] = "0"
+    env["WM_DIRECT_RANK_LOSS_OUTPUT_ROOT"] = str(output_root)
+    env["WM_DIRECT_RANK_LOSS_SENTINEL_DIR"] = str(sentinel_dir)
+    env.setdefault("GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo")
     process = subprocess.Popen(
-        [sys.executable, "-c", child_script],
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nnodes=1",
+            "--nproc_per_node=1",
+            "--master-addr=127.0.0.1",
+            f"--master-port={_unused_tcp_port()}",
+            str(child_script_path),
+        ],
         cwd=repo_root,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=stdout_path.open("w", encoding="utf-8"),
+        stderr=stderr_path.open("w", encoding="utf-8"),
         text=True,
         start_new_session=True,
     )
 
+    def child_logs():
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        return stdout, stderr
+
     def kill_child_group():
+        for pid_path in sentinel_dir.glob("rank*.pid"):
+            try:
+                os.kill(int(pid_path.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (FileNotFoundError, ProcessLookupError, ValueError):
+                pass
         if process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -2287,9 +2312,10 @@ def test_direct_dcp_streaming_sigkill_before_publish_does_not_expose_public_outp
                 pass
 
     deadline = time.monotonic() + 60
+    sentinel = sentinel_dir / "rank0.before_publish"
     while time.monotonic() < deadline and not sentinel.exists():
         if process.poll() is not None:
-            stdout, stderr = process.communicate()
+            stdout, stderr = child_logs()
             pytest.fail(
                 "child exited before reaching the pre-publish kill point\n"
                 f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}"
@@ -2298,14 +2324,16 @@ def test_direct_dcp_streaming_sigkill_before_publish_does_not_expose_public_outp
 
     if not sentinel.exists():
         kill_child_group()
-        stdout, stderr = process.communicate(timeout=10)
+        process.wait(timeout=10)
+        stdout, stderr = child_logs()
         pytest.fail(
             "child did not reach the pre-publish kill point\n"
             f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}"
         )
 
     kill_child_group()
-    stdout, stderr = process.communicate(timeout=10)
+    process.wait(timeout=10)
+    stdout, stderr = child_logs()
     assert process.returncode == -signal.SIGKILL, f"stdout={stdout}\nstderr={stderr}"
 
     temporary_dir = Path(sentinel.read_text(encoding="utf-8").strip())
@@ -2839,9 +2867,7 @@ def test_direct_dcp_streaming_fails_clear_for_unsupported_prepended_axis_without
         assert not (output_root / "latest_checkpointed_iteration.txt").exists()
 
 
-def test_direct_dcp_streaming_fails_clear_for_object_extra_state(
-    tmp_path_dist_ckpt, process_group
-):
+def test_direct_dcp_streaming_copies_object_extra_state(tmp_path_dist_ckpt, process_group):
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_object_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_object_b") as ckpt_b,
@@ -2850,17 +2876,27 @@ def test_direct_dcp_streaming_fails_clear_for_object_extra_state(
         _write_object_extra_checkpoint(ckpt_a, 1.0, extra_value=111, iteration=1)
         _write_object_extra_checkpoint(ckpt_b, 5.0, extra_value=999, iteration=2)
 
-        with pytest.raises(WeightedMergeError, match="tensor _extra_state"):
-            merge_sharded_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root / "merged",
-                lambda: _object_extra_template(),
-                execution_mode="direct-dcp-streaming",
-                streaming_chunk_bytes=16,
-            )
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _object_extra_template(),
+            execution_mode="direct-dcp-streaming",
+            streaming_chunk_bytes=16,
+        )
+        loaded = dist_checkpointing.load(_object_extra_template(), str(result.output_dir))
 
-        assert not (output_root / "merged").exists()
+        assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 4.0))
+        loaded["model"]["decoder.layers.0._extra_state"].seek(0)
+        assert torch.load(loaded["model"]["decoder.layers.0._extra_state"]) == {"value": 111}
+
+        metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+        byte_keys = sorted(
+            str(fqn)
+            for fqn, entry in metadata.state_dict_metadata.items()
+            if type(entry).__name__ == "BytesStorageMetadata"
+        )
+        assert byte_keys == ["model.decoder.layers.0._extra_state/shard_0_1"]
 
 
 def test_merge_rejects_existing_output_directory_by_default(tmp_path_dist_ckpt, process_group):
