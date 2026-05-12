@@ -824,7 +824,9 @@ def write_latest_checkpointed_iteration(checkpoint_dir: Union[str, Path], iterat
     tracker.parent.mkdir(parents=True, exist_ok=True)
     temporary_tracker = tracker.with_name(f".{tracker.name}.tmp.{os.getpid()}")
     temporary_tracker.write_text(f"{iteration}\n", encoding="utf-8")
+    _best_effort_fsync_path(temporary_tracker, "latest checkpoint marker temporary file")
     os.replace(temporary_tracker, tracker)
+    _best_effort_fsync_path(tracker.parent, "latest checkpoint marker directory")
 
 
 def _checkpoint_format(checkpoint_dir: Path) -> str:
@@ -1293,11 +1295,36 @@ def _require_publishable_checkpoint_dir(checkpoint_dir: Path) -> None:
         ) from exc
 
 
+def _best_effort_fsync_path(path: Path, description: str) -> None:
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as exc:
+        print_rank_0(f"WARNING: Could not open {description} {path} for fsync: {exc}", flush=True)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        print_rank_0(f"WARNING: Could not fsync {description} {path}: {exc}", flush=True)
+    finally:
+        os.close(fd)
+
+
+def _best_effort_fsync_checkpoint_metadata(checkpoint_dir: Path) -> None:
+    for name in ("metadata.json", "common.pt", ".metadata"):
+        path = checkpoint_dir / name
+        if path.exists():
+            _best_effort_fsync_path(path, f"checkpoint sidecar {name}")
+    _best_effort_fsync_path(checkpoint_dir, "checkpoint directory")
+
+
 def _publish_temporary_output_dir(
     temporary_dir: Path, output_dir: Path, *, overwrite_output: bool
 ) -> None:
     def publish() -> None:
         _require_publishable_checkpoint_dir(temporary_dir)
+        _best_effort_fsync_checkpoint_metadata(temporary_dir)
         if output_dir.exists():
             if not overwrite_output:
                 raise WeightedMergeError(
@@ -1306,14 +1333,19 @@ def _publish_temporary_output_dir(
                 )
             backup_dir = output_dir.with_name(f".{output_dir.name}.old-{uuid.uuid4().hex}")
             output_dir.rename(backup_dir)
+            _best_effort_fsync_path(output_dir.parent, "checkpoint parent directory")
             try:
                 temporary_dir.rename(output_dir)
+                _best_effort_fsync_checkpoint_metadata(output_dir)
+                _best_effort_fsync_path(output_dir.parent, "checkpoint parent directory")
             except Exception:
                 if not output_dir.exists() and backup_dir.exists():
                     backup_dir.rename(output_dir)
+                    _best_effort_fsync_path(output_dir.parent, "checkpoint parent directory")
                 raise
             try:
                 shutil.rmtree(backup_dir)
+                _best_effort_fsync_path(output_dir.parent, "checkpoint parent directory")
             except Exception as exc:
                 print_rank_0(
                     f"WARNING: Published merged checkpoint to {output_dir}, but failed to "
@@ -1322,6 +1354,8 @@ def _publish_temporary_output_dir(
                 )
             return
         temporary_dir.rename(output_dir)
+        _best_effort_fsync_checkpoint_metadata(output_dir)
+        _best_effort_fsync_path(output_dir.parent, "checkpoint parent directory")
 
     _run_rank0_filesystem_op(f"Publishing merged checkpoint to {output_dir}", publish)
 

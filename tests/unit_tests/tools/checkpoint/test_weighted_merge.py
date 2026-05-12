@@ -709,6 +709,37 @@ def test_publish_temporary_output_dir_requires_public_dcp_metadata(tmp_path):
     assert not output_dir.exists()
 
 
+def test_publish_temporary_output_dir_fsyncs_sidecars_and_parent(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    output_dir = tmp_path_dist_ckpt / "weighted_merge_publish_fsync_out"
+    temporary_dir = tmp_path_dist_ckpt / ".weighted_merge_publish_fsync_out.tmp-deadbeef"
+    temporary_dir.mkdir()
+    _write_checkpoint(temporary_dir, 7.0, iteration=7)
+    fsync_paths = []
+
+    def record_fsync(path, _description):
+        fsync_paths.append(Path(path))
+
+    monkeypatch.setattr(weighted_merge_module, "_best_effort_fsync_path", record_fsync)
+
+    weighted_merge_module._publish_temporary_output_dir(
+        temporary_dir, output_dir, overwrite_output=False
+    )
+
+    assert output_dir.exists()
+    assert not temporary_dir.exists()
+    assert temporary_dir / "metadata.json" in fsync_paths
+    assert temporary_dir / "common.pt" in fsync_paths
+    assert temporary_dir / ".metadata" in fsync_paths
+    assert temporary_dir in fsync_paths
+    assert output_dir / "metadata.json" in fsync_paths
+    assert output_dir / "common.pt" in fsync_paths
+    assert output_dir / ".metadata" in fsync_paths
+    assert output_dir in fsync_paths
+    assert output_dir.parent in fsync_paths
+
+
 def test_direct_dcp_streaming_rejects_existing_output_overwrite_for_crash_safety(
     tmp_path_dist_ckpt, process_group
 ):
@@ -3283,6 +3314,25 @@ def test_latest_marker_requires_checkpoint_metadata(tmp_path):
 
     with pytest.raises(WeightedMergeError, match="metadata"):
         write_latest_checkpointed_iteration(checkpoint_dir, 1)
+
+
+def test_latest_marker_replacement_fsyncs_temporary_file_and_parent(tmp_path, monkeypatch):
+    checkpoint_dir = tmp_path / "iter_0000001"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    fsync_paths = []
+
+    def record_fsync(path, _description):
+        fsync_paths.append(Path(path))
+
+    monkeypatch.setattr(weighted_merge_module, "_best_effort_fsync_path", record_fsync)
+
+    write_latest_checkpointed_iteration(checkpoint_dir, 1)
+
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    assert tracker.read_text(encoding="utf-8").strip() == "1"
+    assert tracker.parent in fsync_paths
+    assert any(path.parent == tracker.parent and path.name.startswith(".latest_checkpointed_iteration.txt.tmp.") for path in fsync_paths)
 
 
 def test_merge_sharded_checkpoints_supports_multiple_model_chunks(
