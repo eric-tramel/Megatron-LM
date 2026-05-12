@@ -3019,7 +3019,7 @@ def test_metadata_same_layout_two_rank_byte_extra_state_round_trip(
             assert len(list(result.output_dir.glob("*.distcp"))) == 2
 
 
-def test_direct_dcp_streaming_fails_clear_for_unsupported_factory(
+def test_direct_dcp_streaming_supports_sharded_tensor_factory_components(
     tmp_path_dist_ckpt, process_group
 ):
     with (
@@ -3030,15 +3030,27 @@ def test_direct_dcp_streaming_fails_clear_for_unsupported_factory(
         _write_factory_checkpoint(ckpt_a, 1.0, iteration=1)
         _write_factory_checkpoint(ckpt_b, 5.0, iteration=2)
 
-        with pytest.raises(WeightedMergeError, match="ShardedTensorFactory"):
-            merge_sharded_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root / "merged",
-                lambda: _factory_template(),
-                execution_mode="direct-dcp-streaming",
-                streaming_chunk_bytes=16,
-            )
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _factory_template(),
+            execution_mode="direct-dcp-streaming",
+            streaming_chunk_bytes=16,
+            verify_load=True,
+        )
+
+        loaded = dist_checkpointing.load(_factory_template(), str(result.output_dir))
+        metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+        metadata_keys = set(metadata.state_dict_metadata)
+
+        assert result.implementation_mode == "direct-dcp-streaming"
+        assert result.verified_load
+        assert torch.allclose(loaded["model"]["weight"], torch.full((4, 2), 4.0))
+        assert "model.factory_weight.left" in metadata_keys
+        assert "model.factory_weight.right" in metadata_keys
+        assert "model.factory_weight" not in metadata_keys
+        assert not (output_root / "merged-staging").exists()
 
 
 def test_direct_dcp_streaming_no_dist_branch_tracks_distributed_world_size(monkeypatch):

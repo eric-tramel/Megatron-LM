@@ -201,6 +201,7 @@ class _StreamingTensorPlan:
 @dataclass(frozen=True)
 class _DirectDcpWriteSpec:
     path: tuple[Union[str, int], ...]
+    load_path: tuple[Union[str, int], ...]
     template_leaf: Any
     sharded_key: str
     global_shape: tuple[int, ...]
@@ -368,7 +369,7 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
             dtype=spec.source_dtype,
             global_shape=spec.source_shape,
         )
-        path_leaves = [(spec.path, load_leaf)]
+        path_leaves = [(spec.load_path, load_leaf)]
         accumulator = torch.zeros(spec.chunk_shape, dtype=torch.float32, device="cpu")
         for checkpoint_dir, weight in zip(self.resolved_input_dirs, self.weights):
             load_start = time.perf_counter()
@@ -378,7 +379,7 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
                 self.load_strategies[checkpoint_dir],
             )
             self.load_time += time.perf_counter() - load_start
-            tensor = _as_tensor(loaded_by_path[spec.path])
+            tensor = _as_tensor(loaded_by_path[spec.load_path])
             if tensor is None:
                 raise WeightedMergeError(
                     f"Checkpoint {checkpoint_dir} key '{_path_label(spec.path)}' "
@@ -1892,30 +1893,37 @@ def _direct_dcp_chunk_sizes(chunk_shape: Iterable[int]) -> torch.Size:
     return torch.Size(tuple(int(dim) for dim in chunk_shape))
 
 
-def _validate_direct_dcp_plan(plan: _StreamingTensorPlan) -> None:
-    if plan.factory_components is not None:
-        raise WeightedMergeError(
-            "direct-dcp-streaming currently supports ordinary ShardedTensor leaves only; "
-            f"'{_path_label(plan.path, plan.template_leaf)}' is a ShardedTensorFactory. "
-            "Use --merge-execution-mode=file-backed-streaming for this checkpoint."
-        )
-    leaf = plan.template_leaf
+def _validate_direct_dcp_leaf(
+    leaf: Any, path: tuple[Union[str, int], ...], *, label_prefix: str = "direct-dcp-streaming"
+) -> None:
     if int(getattr(leaf, "prepend_axis_num", 0) or 0) != 0:
         raise WeightedMergeError(
-            "direct-dcp-streaming does not yet support prepended-axis tensors; "
-            f"'{_path_label(plan.path, leaf)}' has prepend_axis_num="
+            f"{label_prefix} does not yet support prepended-axis tensors; "
+            f"'{_path_label(path, leaf)}' has prepend_axis_num="
             f"{getattr(leaf, 'prepend_axis_num')}. Use file-backed-streaming."
         )
     if getattr(leaf, "flattened_range", None) is not None:
         raise WeightedMergeError(
-            "direct-dcp-streaming does not yet support flattened-range tensors; "
-            f"'{_path_label(plan.path, leaf)}' uses flattened_range. Use file-backed-streaming."
+            f"{label_prefix} does not yet support flattened-range tensors; "
+            f"'{_path_label(path, leaf)}' uses flattened_range. Use file-backed-streaming."
         )
     sharded_key = getattr(leaf, "key", None)
     if not sharded_key:
         raise WeightedMergeError(
-            f"direct-dcp-streaming requires a sharded key for '{_path_label(plan.path, leaf)}'."
+            f"{label_prefix} requires a sharded key for '{_path_label(path, leaf)}'."
         )
+
+
+def _validate_direct_dcp_plan(plan: _StreamingTensorPlan) -> None:
+    if plan.factory_components is not None:
+        for component_plan in plan.factory_components:
+            _validate_direct_dcp_leaf(
+                component_plan.component_leaf,
+                plan.path + component_plan.component_path,
+                label_prefix="direct-dcp-streaming factory component",
+            )
+        return
+    _validate_direct_dcp_leaf(plan.template_leaf, plan.path)
 
 
 def _build_direct_dcp_write_specs(
@@ -1931,33 +1939,39 @@ def _build_direct_dcp_write_specs(
     byte_candidates: list[_DcpMetadataByteCandidate] = []
     merge_chunk_count = 0
 
-    for plan in tensor_plans:
-        _validate_direct_dcp_plan(plan)
-        if plan.source_dtype is None or plan.source_shape is None:
-            raise WeightedMergeError(
-                f"Direct DCP tensor plan for '{_path_label(plan.path, plan.template_leaf)}' "
-                "is missing source metadata."
-            )
-        sharded_key = str(getattr(plan.template_leaf, "key"))
+    def append_tensor_specs(
+        *,
+        path: tuple[Union[str, int], ...],
+        load_path: tuple[Union[str, int], ...],
+        template_leaf: Any,
+        sharded_key: str,
+        global_shape: tuple[int, ...],
+        local_shape: tuple[int, ...],
+        target_dtype: torch.dtype,
+        source_dtype: torch.dtype,
+        source_shape: tuple[int, ...],
+    ) -> None:
+        nonlocal merge_chunk_count
         for chunk_dim, chunk_start, chunk_length in _chunk_ranges_for_local_shape(
-            plan.template_shape, streaming_chunk_bytes
+            local_shape, streaming_chunk_bytes
         ):
             if chunk_length == 0:
                 continue
-            chunk_shape = list(plan.template_shape)
+            chunk_shape = list(local_shape)
             if chunk_dim >= 0:
                 chunk_shape[chunk_dim] = chunk_length
             chunk_shape_tuple = tuple(int(dim) for dim in chunk_shape)
             write_specs.append(
                 _DirectDcpWriteSpec(
-                    path=plan.path,
-                    template_leaf=plan.template_leaf,
+                    path=path,
+                    load_path=load_path,
+                    template_leaf=template_leaf,
                     sharded_key=sharded_key,
-                    global_shape=tuple(int(dim) for dim in plan.source_shape),
+                    global_shape=tuple(int(dim) for dim in global_shape),
                     global_offsets=tuple(
                         int(offset)
                         for offset in _direct_dcp_global_offsets(
-                            plan.template_leaf,
+                            template_leaf,
                             chunk_dim=chunk_dim,
                             chunk_start=chunk_start,
                         )
@@ -1965,15 +1979,58 @@ def _build_direct_dcp_write_specs(
                     chunk_shape=tuple(
                         int(size) for size in _direct_dcp_chunk_sizes(chunk_shape_tuple)
                     ),
-                    target_dtype=plan.target_dtype,
+                    target_dtype=target_dtype,
                     chunk_dim=chunk_dim,
                     chunk_start=chunk_start,
                     chunk_length=chunk_length,
-                    source_dtype=plan.source_dtype,
-                    source_shape=plan.source_shape,
+                    source_dtype=source_dtype,
+                    source_shape=source_shape,
                 )
             )
             merge_chunk_count += 1
+
+    for plan in tensor_plans:
+        _validate_direct_dcp_plan(plan)
+        if plan.factory_components is not None:
+            for component_index, component_plan in enumerate(plan.factory_components):
+                component_tensor = _as_tensor(component_plan.component_leaf)
+                if component_tensor is None:
+                    raise WeightedMergeError(
+                        "direct-dcp-streaming factory component "
+                        f"'{_path_label(plan.path + component_plan.component_path, component_plan.component_leaf)}' "
+                        "does not expose tensor data."
+                    )
+                append_tensor_specs(
+                    path=plan.path + component_plan.component_path,
+                    load_path=_streaming_factory_component_load_path(
+                        plan.path, component_index
+                    ),
+                    template_leaf=component_plan.component_leaf,
+                    sharded_key=str(getattr(component_plan.component_leaf, "key")),
+                    global_shape=component_plan.source_shape,
+                    local_shape=tuple(int(dim) for dim in component_tensor.shape),
+                    target_dtype=plan.target_dtype,
+                    source_dtype=component_plan.source_dtype,
+                    source_shape=component_plan.source_shape,
+                )
+            continue
+        if plan.source_dtype is None or plan.source_shape is None:
+            raise WeightedMergeError(
+                f"Direct DCP tensor plan for '{_path_label(plan.path, plan.template_leaf)}' "
+                "is missing source metadata."
+            )
+        sharded_key = str(getattr(plan.template_leaf, "key"))
+        append_tensor_specs(
+            path=plan.path,
+            load_path=plan.path,
+            template_leaf=plan.template_leaf,
+            sharded_key=sharded_key,
+            global_shape=plan.source_shape,
+            local_shape=plan.template_shape,
+            target_dtype=plan.target_dtype,
+            source_dtype=plan.source_dtype,
+            source_shape=plan.source_shape,
+        )
 
     extra_metadata = tensor_metadata_by_checkpoint[extra_state_source_index]
     for path in extra_paths:
@@ -2019,6 +2076,7 @@ def _build_direct_dcp_write_specs(
         write_specs.append(
             _DirectDcpWriteSpec(
                 path=path,
+                load_path=path,
                 template_leaf=template_leaf,
                 sharded_key=str(sharded_key),
                 global_shape=metadata_shape,
@@ -2326,6 +2384,7 @@ def _build_metadata_same_layout_write_specs(
             write_specs.append(
                 _DirectDcpWriteSpec(
                     path=path,
+                    load_path=path,
                     template_leaf=template_leaf,
                     sharded_key=fqn,
                     global_shape=layout.global_shape,
