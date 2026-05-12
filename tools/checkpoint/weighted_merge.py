@@ -1230,6 +1230,22 @@ def _prepare_temporary_output_dir(output_dir: Path, overwrite_output: bool) -> P
     return temporary_dir
 
 
+def _reject_existing_atomic_overwrite(
+    output_dir: Path,
+    *,
+    overwrite_output: bool,
+    atomic_output: bool,
+) -> None:
+    if not (atomic_output and overwrite_output and output_dir.exists()):
+        return
+    raise WeightedMergeError(
+        f"Refusing to replace existing output directory {output_dir} with atomic "
+        "publication: non-empty checkpoint directory overwrite cannot be made "
+        "crash-atomic with normal filesystem rename semantics. Remove the existing "
+        "checkpoint explicitly or write to a new output path/iteration."
+    )
+
+
 def _require_publishable_checkpoint_dir(checkpoint_dir: Path) -> None:
     if not (checkpoint_dir / "metadata.json").exists():
         raise WeightedMergeError(
@@ -2410,6 +2426,9 @@ def merge_same_layout_dcp_metadata_checkpoints(
 
     weights = normalize_weights(weights) if normalize else validate_weights(weights)
     output_dir = output_checkpoint_dir(output_root, output_iteration)
+    _reject_existing_atomic_overwrite(
+        output_dir, overwrite_output=overwrite_output, atomic_output=atomic_output
+    )
     if not atomic_output and output_dir.exists() and not overwrite_output:
         raise WeightedMergeError(
             f"Output directory already exists: {output_dir}. "
@@ -3405,6 +3424,9 @@ def merge_sharded_checkpoints(
     )
     weights = normalize_weights(weights) if normalize else validate_weights(weights)
     output_dir = output_checkpoint_dir(output_root, output_iteration)
+    _reject_existing_atomic_overwrite(
+        output_dir, overwrite_output=overwrite_output, atomic_output=atomic_output
+    )
     if not atomic_output and output_dir.exists() and not overwrite_output:
         raise WeightedMergeError(
             f"Output directory already exists: {output_dir}. "

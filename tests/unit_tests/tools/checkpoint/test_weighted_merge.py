@@ -701,14 +701,14 @@ def test_publish_temporary_output_dir_requires_public_dcp_metadata(tmp_path):
     assert not output_dir.exists()
 
 
-def test_direct_dcp_streaming_overwrite_final_rename_failure_rolls_back_and_keeps_latest(
-    tmp_path_dist_ckpt, process_group, monkeypatch
+def test_direct_dcp_streaming_rejects_existing_output_overwrite_for_crash_safety(
+    tmp_path_dist_ckpt, process_group
 ):
     with (
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_overwrite_fail_a") as ckpt_a,
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_overwrite_fail_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_overwrite_reject_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_overwrite_reject_b") as ckpt_b,
         TempNamedDir(
-            tmp_path_dist_ckpt / "weighted_merge_direct_overwrite_fail_out"
+            tmp_path_dist_ckpt / "weighted_merge_direct_overwrite_reject_out"
         ) as output_root,
     ):
         _write_checkpoint(ckpt_a, 1.0, iteration=1)
@@ -718,18 +718,7 @@ def test_direct_dcp_streaming_overwrite_final_rename_failure_rolls_back_and_keep
         _write_checkpoint(final_dir, 9.0, iteration=29)
         write_latest_checkpointed_iteration(final_dir, 29)
 
-        real_rename = Path.rename
-
-        def fail_final_publish_rename(self, target):
-            target = Path(target)
-            if self.parent == output_root and self.name.startswith(".iter_0000030.tmp-"):
-                assert target == final_dir
-                raise OSError("injected final publish rename failure")
-            return real_rename(self, target)
-
-        monkeypatch.setattr(Path, "rename", fail_final_publish_rename)
-
-        with pytest.raises(OSError, match="injected final publish rename failure"):
+        with pytest.raises(WeightedMergeError, match="crash-atomic"):
             merge_sharded_checkpoints(
                 [ckpt_a, ckpt_b],
                 [0.25, 0.75],
@@ -745,9 +734,7 @@ def test_direct_dcp_streaming_overwrite_final_rename_failure_rolls_back_and_keep
         torch.testing.assert_close(restored["model"]["weight"], torch.full((2, 2), 9.0))
         assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "29"
         assert not list(output_root.glob(".iter_0000030.old-*"))
-        temporary_dirs = list(output_root.glob(".iter_0000030.tmp-*"))
-        assert len(temporary_dirs) == 1
-        torch_dcp.FileSystemReader(temporary_dirs[0]).read_metadata()
+        assert not list(output_root.glob(".iter_0000030.tmp-*"))
 
 
 def test_publish_temporary_output_dir_overwrite_backup_cleanup_failure_is_nonfatal(
@@ -2217,6 +2204,39 @@ def test_metadata_same_layout_rejects_no_atomic_output(tmp_path_dist_ckpt, proce
             tmp_path_dist_ckpt / "merged",
             atomic_output=False,
         )
+
+
+def test_metadata_same_layout_rejects_existing_output_overwrite_for_crash_safety(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_metadata_overwrite_reject_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_metadata_overwrite_reject_b") as ckpt_b,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_metadata_overwrite_reject_out"
+        ) as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2)
+        final_dir = output_root / "iter_0000030"
+        final_dir.mkdir()
+        _write_checkpoint(final_dir, 9.0, iteration=29)
+        write_latest_checkpointed_iteration(final_dir, 29)
+
+        with pytest.raises(WeightedMergeError, match="crash-atomic"):
+            merge_same_layout_dcp_metadata_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                output_iteration=30,
+                overwrite_output=True,
+            )
+
+        restored = _load_checkpoint(final_dir)
+        torch.testing.assert_close(restored["model"]["weight"], torch.full((2, 2), 9.0))
+        assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "29"
+        assert not list(output_root.glob(".iter_0000030.old-*"))
+        assert not list(output_root.glob(".iter_0000030.tmp-*"))
 
 
 def test_metadata_same_layout_rejects_mismatched_metadata(

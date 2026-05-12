@@ -224,6 +224,9 @@ flattened-range tensors, object `_extra_state` support, Super-scale RSS, and
 literal 1T+ proof are not validated by the current direct-output evidence. Hard
 rank death, process kill, filesystem crash, and process-group hangs still rely
 on launcher/process-group timeout or filesystem behavior and are not proven
-here. Overwrite replacement is best-effort exception rollback, not crash-atomic
-overwrite. Post-publication `--verify-load` is a smoke check, not a publication
-gate.
+here. Atomic publication refuses to replace an existing checkpoint directory,
+because normal filesystem rename semantics cannot make non-empty directory
+overwrite crash-atomic; remove the old output explicitly or choose a new output
+path/iteration. Post-publication `--verify-load` is a smoke check for non-direct
+modes, while `direct-dcp-streaming` verifies the hidden temporary checkpoint
+before final publication when `--verify-load` is set.
