@@ -1878,14 +1878,21 @@ def _report_save_metadata_cache_reuse(
 def _direct_dcp_global_offsets(
     leaf: Any, *, chunk_dim: int, chunk_start: int
 ) -> torch.Size:
+    prepended_axis_num = int(getattr(leaf, "prepend_axis_num", 0) or 0)
     global_offset = list(getattr(leaf, "global_offset", ()))
     if not global_offset:
         tensor = _as_tensor(leaf)
         if tensor is None:
             raise WeightedMergeError(f"Cannot infer DCP offsets for non-tensor leaf {leaf!r}.")
-        global_offset = [0 for _ in tensor.shape]
+        global_offset = [0 for _ in range(prepended_axis_num + tensor.ndim)]
     if chunk_dim >= 0:
-        global_offset[chunk_dim] += chunk_start
+        offset_index = prepended_axis_num + chunk_dim
+        if offset_index >= len(global_offset):
+            raise WeightedMergeError(
+                f"Cannot map chunk dimension {chunk_dim} for '{getattr(leaf, 'key', leaf)!r}' "
+                f"with prepend_axis_num={prepended_axis_num} and global_offset={global_offset}."
+            )
+        global_offset[offset_index] += chunk_start
     return torch.Size(global_offset)
 
 
@@ -1893,15 +1900,14 @@ def _direct_dcp_chunk_sizes(chunk_shape: Iterable[int]) -> torch.Size:
     return torch.Size(tuple(int(dim) for dim in chunk_shape))
 
 
+def _direct_dcp_leaf_chunk_sizes(leaf: Any, chunk_shape: Iterable[int]) -> torch.Size:
+    prepended_axis_num = int(getattr(leaf, "prepend_axis_num", 0) or 0)
+    return _direct_dcp_chunk_sizes((1,) * prepended_axis_num + tuple(chunk_shape))
+
+
 def _validate_direct_dcp_leaf(
     leaf: Any, path: tuple[Union[str, int], ...], *, label_prefix: str = "direct-dcp-streaming"
 ) -> None:
-    if int(getattr(leaf, "prepend_axis_num", 0) or 0) != 0:
-        raise WeightedMergeError(
-            f"{label_prefix} does not yet support prepended-axis tensors; "
-            f"'{_path_label(path, leaf)}' has prepend_axis_num="
-            f"{getattr(leaf, 'prepend_axis_num')}. Use file-backed-streaming."
-        )
     if getattr(leaf, "flattened_range", None) is not None:
         raise WeightedMergeError(
             f"{label_prefix} does not yet support flattened-range tensors; "
@@ -1977,7 +1983,10 @@ def _build_direct_dcp_write_specs(
                         )
                     ),
                     chunk_shape=tuple(
-                        int(size) for size in _direct_dcp_chunk_sizes(chunk_shape_tuple)
+                        int(size)
+                        for size in _direct_dcp_leaf_chunk_sizes(
+                            template_leaf, chunk_shape_tuple
+                        )
                     ),
                     target_dtype=target_dtype,
                     chunk_dim=chunk_dim,

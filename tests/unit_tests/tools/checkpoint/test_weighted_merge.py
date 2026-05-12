@@ -3066,7 +3066,7 @@ def test_direct_dcp_streaming_no_dist_branch_tracks_distributed_world_size(monke
     assert weighted_merge_module._direct_dcp_save_uses_no_dist() is False
 
 
-def test_direct_dcp_streaming_fails_clear_for_unsupported_prepended_axis_without_publication(
+def test_direct_dcp_streaming_supports_prepended_axis_tensors(
     tmp_path_dist_ckpt, process_group
 ):
     with (
@@ -3077,19 +3077,21 @@ def test_direct_dcp_streaming_fails_clear_for_unsupported_prepended_axis_without
         _write_prepended_axis_checkpoint(ckpt_a, 1.0, iteration=1)
         _write_prepended_axis_checkpoint(ckpt_b, 5.0, iteration=2)
 
-        with pytest.raises(WeightedMergeError, match="prepended-axis"):
-            merge_sharded_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root,
-                lambda: _prepended_axis_template(),
-                output_iteration=30,
-                execution_mode="direct-dcp-streaming",
-                streaming_chunk_bytes=16,
-            )
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _prepended_axis_template(),
+            execution_mode="direct-dcp-streaming",
+            streaming_chunk_bytes=16,
+            verify_load=True,
+        )
+        loaded = dist_checkpointing.load(_prepended_axis_template(), str(result.output_dir))
 
-        assert not (output_root / "iter_0000030").exists()
-        assert not (output_root / "latest_checkpointed_iteration.txt").exists()
+        assert result.implementation_mode == "direct-dcp-streaming"
+        assert result.verified_load
+        assert torch.allclose(loaded["model"]["weight"], torch.full((4, 2), 4.0))
+        assert not (output_root / "merged-staging").exists()
 
 
 def test_direct_dcp_streaming_copies_object_extra_state(tmp_path_dist_ckpt, process_group):
