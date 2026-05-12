@@ -92,7 +92,12 @@ BYTE_ACCOUNTING_MODES = ("none", "rank0", "all")
 RESOURCE_LOG_MODES = ("none", "rank0", "all")
 FILE_BACKED_STAGING_LAYOUTS = ("shared-dtype", "per-tensor")
 METADATA_SAME_LAYOUT_MODEL_PREFIXES = ("model.", "model0.", "model1.")
-METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS = ("decoder.", "embedding.", "output_layer.")
+METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS = (
+    "decoder.",
+    "embedding.",
+    "output_layer.",
+    "mtp.",
+)
 
 
 class WeightedMergeError(ValueError):

@@ -200,6 +200,7 @@ def _write_generated_moe_gpt_checkpoint(path, value):
 
 
 UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY = "decoder.layers.0.mlp.linear_fc1._extra_state"
+UNPREFIXED_MTP_BYTE_EXTRA_STATE_KEY = "mtp.layers.0.eh_proj._extra_state"
 
 
 def _unprefixed_gpt_like_model_state(value, *, rank_sharded=False):
@@ -254,6 +255,23 @@ def _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(
     state = _unprefixed_gpt_like_model_state(value, rank_sharded=rank_sharded)
     state[UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY] = ShardedObject(
         UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY,
+        _bytesio_state(extra_value),
+        (_world_size(),),
+        (_rank(),),
+        replica_id=0,
+    )
+    dist_checkpointing.save(state, str(path))
+
+
+def _write_unprefixed_gpt_like_checkpoint_with_mtp_state(path, value, extra_value):
+    state = _unprefixed_gpt_like_model_state(value)
+    state["mtp.layers.0.eh_proj.weight"] = ShardedTensor.from_rank_offsets(
+        "mtp.layers.0.eh_proj.weight",
+        torch.full((2, 2), value + 4, dtype=torch.float32),
+        replica_id=0,
+    )
+    state[UNPREFIXED_MTP_BYTE_EXTRA_STATE_KEY] = ShardedObject(
+        UNPREFIXED_MTP_BYTE_EXTRA_STATE_KEY,
         _bytesio_state(extra_value),
         (_world_size(),),
         (_rank(),),
@@ -2002,6 +2020,47 @@ def test_metadata_same_layout_copies_unprefixed_byte_extra_state_from_selected_s
         assert torch.load(normal_extra_state, weights_only=False) == {"value": 999}
 
 
+def test_metadata_same_layout_accepts_unprefixed_mtp_tensor_and_byte_extra_state(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_mtp_bytes_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_mtp_bytes_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_mtp_bytes_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint_with_mtp_state(ckpt_a, 1.0, 111)
+        _write_unprefixed_gpt_like_checkpoint_with_mtp_state(ckpt_b, 5.0, 999)
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=52,
+            extra_state_source_index=1,
+        )
+
+        assert result.output_dir == output_root / "iter_0000052"
+        assert result.averaged_tensors == 5
+        assert result.copied_extra_states == 1
+
+        public_state = {
+            "mtp.layers.0.eh_proj.weight": torch.empty((2, 2), dtype=torch.float32),
+        }
+        torch_dcp.load(public_state, checkpoint_id=str(result.output_dir), no_dist=True)
+        assert torch.equal(
+            public_state["mtp.layers.0.eh_proj.weight"],
+            torch.full((2, 2), 8.0),
+        )
+
+        object_key = f"{UNPREFIXED_MTP_BYTE_EXTRA_STATE_KEY}/shard_0_1"
+        loaded = dist_checkpointing.load(
+            {object_key: ShardedObject.empty_from_unique_key(object_key)},
+            str(result.output_dir),
+            validate_access_integrity=False,
+        )
+        assert _decode_sharded_object_value(loaded[object_key]) == {"value": 999}
+
+
 def test_metadata_same_layout_rejects_byte_objects_outside_model_roots(
     tmp_path_dist_ckpt, process_group
 ):
@@ -2380,6 +2439,103 @@ def test_direct_dcp_streaming_sigkill_before_publish_does_not_expose_public_outp
     assert (temporary_dir / "common.pt").exists()
     assert not (output_root / "iter_0000030").exists()
     assert not (output_root / "latest_checkpointed_iteration.txt").exists()
+
+
+def test_direct_dcp_streaming_sigkill_after_publish_before_marker_keeps_checkpoint(
+    tmp_path, process_group
+):
+    if not hasattr(os, "killpg") or not hasattr(signal, "SIGKILL"):
+        pytest.skip("after-publish hard-kill proof requires POSIX process groups")
+
+    output_root = tmp_path / "weighted_merge_direct_after_publish_sigkill_out"
+    sentinel_dir = tmp_path / "sentinels"
+    repo_root = Path(__file__).resolve().parents[4]
+    child_script_path = (
+        repo_root / "tests/unit_tests/tools/checkpoint/direct_output_rank_loss_repro.py"
+    )
+    stdout_path = tmp_path / "torchrun-after-publish.stdout"
+    stderr_path = tmp_path / "torchrun-after-publish.stderr"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONUNBUFFERED"] = "1"
+    env["WM_DIRECT_RANK_LOSS_BLOCK_POINT"] = "after_publish_before_marker"
+    env["WM_DIRECT_RANK_LOSS_OUTPUT_ROOT"] = str(output_root)
+    env["WM_DIRECT_RANK_LOSS_SENTINEL_DIR"] = str(sentinel_dir)
+    env.setdefault("GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nnodes=1",
+            "--nproc_per_node=1",
+            "--master-addr=127.0.0.1",
+            f"--master-port={_unused_tcp_port()}",
+            str(child_script_path),
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=stdout_path.open("w", encoding="utf-8"),
+        stderr=stderr_path.open("w", encoding="utf-8"),
+        text=True,
+        start_new_session=True,
+    )
+
+    def child_logs():
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        return stdout, stderr
+
+    def kill_child_group():
+        for pid_path in sentinel_dir.glob("rank*.pid"):
+            try:
+                os.kill(int(pid_path.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (FileNotFoundError, ProcessLookupError, ValueError):
+                pass
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    try:
+        deadline = time.monotonic() + 60
+        sentinel = sentinel_dir / "rank0.after_publish_before_marker"
+        while time.monotonic() < deadline and not sentinel.exists():
+            if process.poll() is not None:
+                stdout, stderr = child_logs()
+                pytest.fail(
+                    "child exited before reaching the after-publish kill point\n"
+                    f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}"
+                )
+            time.sleep(0.05)
+
+        if not sentinel.exists():
+            kill_child_group()
+            process.wait(timeout=10)
+            stdout, stderr = child_logs()
+            pytest.fail(
+                "child did not reach the after-publish kill point\n"
+                f"returncode={process.returncode}\nstdout={stdout}\nstderr={stderr}"
+            )
+
+        final_dir = Path(sentinel.read_text(encoding="utf-8").strip())
+        assert final_dir == output_root / "iter_0000030"
+        assert final_dir.exists()
+        torch_dcp.FileSystemReader(final_dir).read_metadata()
+        assert (final_dir / "metadata.json").exists()
+        assert (final_dir / "common.pt").exists()
+        assert not (output_root / "latest_checkpointed_iteration.txt").exists()
+        loaded = _load_checkpoint(final_dir)
+        torch.testing.assert_close(loaded["model"]["weight"], torch.full((2, 2), 4.0))
+
+        kill_child_group()
+        process.wait(timeout=10)
+        stdout, stderr = child_logs()
+        assert process.returncode == -signal.SIGKILL, f"stdout={stdout}\nstderr={stderr}"
+        assert not (output_root / "latest_checkpointed_iteration.txt").exists()
+    finally:
+        kill_child_group()
 
 
 def test_direct_dcp_streaming_two_rank_sigkill_before_publish_is_bounded_and_hidden(tmp_path):

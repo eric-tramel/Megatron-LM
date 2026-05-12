@@ -85,14 +85,31 @@ def main() -> None:
         state_dict["iteration"] = iteration
         dist_checkpointing.save(state_dict, str(path))
 
-    def block_before_publish(temporary_dir, output_dir, *, overwrite_output):
-        wm._require_publishable_checkpoint_dir(temporary_dir)
-        _write_fsynced(sentinel_dir / f"rank{rank}.before_publish", str(temporary_dir))
-        dist.barrier()
-        while True:
-            time.sleep(1)
+    block_point = os.environ.get("WM_DIRECT_RANK_LOSS_BLOCK_POINT", "before_publish")
+    if block_point == "before_publish":
 
-    wm._publish_temporary_output_dir = block_before_publish
+        def block_before_publish(temporary_dir, output_dir, *, overwrite_output):
+            wm._require_publishable_checkpoint_dir(temporary_dir)
+            _write_fsynced(sentinel_dir / f"rank{rank}.before_publish", str(temporary_dir))
+            dist.barrier()
+            while True:
+                time.sleep(1)
+
+        wm._publish_temporary_output_dir = block_before_publish
+    elif block_point == "after_publish_before_marker":
+
+        def block_before_latest_marker(checkpoint_dir, iteration):
+            wm._require_publishable_checkpoint_dir(Path(checkpoint_dir))
+            _write_fsynced(
+                sentinel_dir / f"rank{rank}.after_publish_before_marker",
+                str(checkpoint_dir),
+            )
+            while True:
+                time.sleep(1)
+
+        wm.write_latest_checkpointed_iteration = block_before_latest_marker
+    else:
+        raise RuntimeError(f"unsupported WM_DIRECT_RANK_LOSS_BLOCK_POINT={block_point}")
     output_root.mkdir(parents=True, exist_ok=True)
     ckpt_a = output_root / "input_a"
     ckpt_b = output_root / "input_b"

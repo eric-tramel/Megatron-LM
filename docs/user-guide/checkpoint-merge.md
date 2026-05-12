@@ -155,7 +155,7 @@ Use this mode only when every input checkpoint has the same model tensor key set
 global shapes, DCP chunk offsets/sizes, byte/object `_extra_state` key set, and,
 for `--merge-save-dtype=same`, dtypes. The mode infers mergeable model tensors
 from keys starting with `model.`, `model0.`, or `model1.`, and from unprefixed
-Megatron GPT model roots `decoder.`, `embedding.`, and `output_layer.`. It
+Megatron model roots `decoder.`, `embedding.`, `output_layer.`, and `mtp.`. It
 rejects other DCP tensor roots instead of guessing whether they are optimizer,
 RNG, or other non-model state. Tensor `_extra_state` entries and byte/object
 `_extra_state` entries under supported model roots are copied from
