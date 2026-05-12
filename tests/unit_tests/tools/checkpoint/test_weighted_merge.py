@@ -464,6 +464,43 @@ def _write_object_extra_checkpoint(path, value, extra_value, iteration):
     dist_checkpointing.save(state_dict, str(path))
 
 
+def _rank_local_object_extra_key(rank=None):
+    rank = _rank() if rank is None else rank
+    return f"decoder.layers.{rank}._extra_state"
+
+
+def _rank_local_object_extra_template(extra_value=0):
+    rank = _rank()
+    rank_offsets = _rank_offsets()
+    local_extra_key = _rank_local_object_extra_key(rank)
+    return {
+        "model": {
+            "weight": ShardedTensor.from_rank_offsets(
+                "model.weight",
+                torch.zeros((2, 2), dtype=torch.float32),
+                *rank_offsets,
+                replica_id=0,
+            ),
+            local_extra_key: ShardedObject(
+                f"model.{local_extra_key}",
+                _bytesio_state(extra_value),
+                (1,),
+                (0,),
+                replica_id=0,
+            ),
+        }
+    }
+
+
+def _write_rank_local_object_extra_checkpoint(path, value, extra_value, iteration):
+    state_dict = _rank_local_object_extra_template(extra_value)
+    state_dict["model"]["weight"].data.fill_(value)
+    state_dict["args"] = SimpleNamespace(iteration=iteration, hidden_size=2)
+    state_dict["checkpoint_version"] = 3.0
+    state_dict["iteration"] = iteration
+    dist_checkpointing.save(state_dict, str(path))
+
+
 def _multi_chunk_template(value=0.0, *, dtype=torch.float32):
     rank_offsets = _rank_offsets()
     return {
@@ -2897,6 +2934,68 @@ def test_direct_dcp_streaming_copies_object_extra_state(tmp_path_dist_ckpt, proc
             if type(entry).__name__ == "BytesStorageMetadata"
         )
         assert byte_keys == ["model.decoder.layers.0._extra_state/shard_0_1"]
+
+
+def test_direct_dcp_streaming_two_rank_copies_rank_local_object_extra_state(
+    tmp_path_dist_ckpt, process_group
+):
+    if _world_size() != 2:
+        pytest.skip("rank-local direct-DCP byte/object coverage requires torchrun --nproc_per_node=2")
+
+    with (
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_direct_rank_local_object_a", sync=True
+        ) as ckpt_a,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_direct_rank_local_object_b", sync=True
+        ) as ckpt_b,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_direct_rank_local_object_out", sync=True
+        ) as output_root,
+    ):
+        rank = _rank()
+        _write_rank_local_object_extra_checkpoint(
+            ckpt_a, 1.0 + rank, extra_value=111 + rank, iteration=1
+        )
+        _write_rank_local_object_extra_checkpoint(
+            ckpt_b, 5.0 + (2 * rank), extra_value=999 + rank, iteration=2
+        )
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _rank_local_object_extra_template(),
+            execution_mode="direct-dcp-streaming",
+            streaming_chunk_bytes=16,
+            extra_state_source_index=1,
+            verify_load=True,
+        )
+        loaded = dist_checkpointing.load(
+            _rank_local_object_extra_template(), str(result.output_dir)
+        )
+
+        expected_rank_weight = 4.0 + (1.75 * rank)
+        assert torch.equal(
+            loaded["model"]["weight"], torch.full((2, 2), expected_rank_weight)
+        )
+        local_extra_key = _rank_local_object_extra_key(rank)
+        loaded["model"][local_extra_key].seek(0)
+        assert torch.load(loaded["model"][local_extra_key], weights_only=False) == {
+            "value": 999 + rank
+        }
+
+        metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+        byte_keys = sorted(
+            str(fqn)
+            for fqn, entry in metadata.state_dict_metadata.items()
+            if type(entry).__name__ == "BytesStorageMetadata"
+        )
+        assert byte_keys == [
+            "model.decoder.layers.0._extra_state/shard_0_1",
+            "model.decoder.layers.1._extra_state/shard_0_1",
+        ]
+        assert not _dcp_metadata_summary(result.output_dir)["duplicate_storage_records"]
 
 
 def test_merge_rejects_existing_output_directory_by_default(tmp_path_dist_ckpt, process_group):

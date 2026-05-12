@@ -60,6 +60,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensor,
     ShardedTensorFactory,
+    is_main_replica,
 )
 from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
 from megatron.core.dist_checkpointing.state_dict_utils import load_preprocess
@@ -221,6 +222,14 @@ class _DcpMetadataByteSpec:
     fqn: str
     path: tuple[Union[str, int], ...]
     template_leaf: ShardedObject
+
+
+@dataclass(frozen=True)
+class _DcpMetadataByteCandidate:
+    fqn: str
+    path: tuple[Union[str, int], ...]
+    template_leaf: ShardedObject
+    is_main_replica: bool
 
 
 @dataclass(frozen=True)
@@ -1095,6 +1104,57 @@ def _direct_dcp_save_uses_no_dist() -> bool:
     return not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1
 
 
+def _select_direct_dcp_byte_specs(
+    byte_candidates: list[_DcpMetadataByteCandidate],
+) -> list[_DcpMetadataByteSpec]:
+    """Elect one DCP writer for each byte/object _extra_state unique key."""
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return [
+            _DcpMetadataByteSpec(
+                fqn=candidate.fqn,
+                path=candidate.path,
+                template_leaf=candidate.template_leaf,
+            )
+            for candidate in byte_candidates
+        ]
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_records = [
+        (candidate.fqn, rank, candidate.is_main_replica) for candidate in byte_candidates
+    ]
+    gathered_records: list[list[tuple[str, int, bool]]] = [[] for _ in range(world_size)]
+    dist.all_gather_object(gathered_records, local_records)
+
+    writer_rank_by_fqn: dict[str, int] = {}
+    writer_priority_by_fqn: dict[str, tuple[int, int]] = {}
+    for records in gathered_records:
+        for fqn, candidate_rank, candidate_is_main_replica in records:
+            priority = (0 if candidate_is_main_replica else 1, int(candidate_rank))
+            if fqn not in writer_priority_by_fqn or priority < writer_priority_by_fqn[fqn]:
+                writer_priority_by_fqn[fqn] = priority
+                writer_rank_by_fqn[fqn] = int(candidate_rank)
+
+    selected_fqns = {
+        fqn for fqn, writer_rank in writer_rank_by_fqn.items() if writer_rank == rank
+    }
+    byte_specs: list[_DcpMetadataByteSpec] = []
+    seen_fqns: set[str] = set()
+    for candidate in byte_candidates:
+        if candidate.fqn not in selected_fqns or candidate.fqn in seen_fqns:
+            continue
+        seen_fqns.add(candidate.fqn)
+        byte_specs.append(
+            _DcpMetadataByteSpec(
+                fqn=candidate.fqn,
+                path=candidate.path,
+                template_leaf=candidate.template_leaf,
+            )
+        )
+    return byte_specs
+
+
 def _git_revision() -> Optional[str]:
     try:
         result = subprocess.run(
@@ -1847,11 +1907,8 @@ def _build_direct_dcp_write_specs(
     streaming_chunk_bytes: int,
 ) -> tuple[list[_DirectDcpWriteSpec], list[_DcpMetadataByteSpec], int]:
     write_specs: list[_DirectDcpWriteSpec] = []
-    byte_specs: list[_DcpMetadataByteSpec] = []
+    byte_candidates: list[_DcpMetadataByteCandidate] = []
     merge_chunk_count = 0
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-    byte_extra_state_index = 0
 
     for plan in tensor_plans:
         _validate_direct_dcp_plan(plan)
@@ -1909,15 +1966,14 @@ def _build_direct_dcp_write_specs(
         template_tensor = _as_tensor(template_leaf)
         if template_tensor is None:
             if isinstance(template_leaf, ShardedObject):
-                if byte_extra_state_index % world_size == rank:
-                    byte_specs.append(
-                        _DcpMetadataByteSpec(
-                            fqn=str(getattr(template_leaf, "unique_key", sharded_key)),
-                            path=path,
-                            template_leaf=template_leaf,
-                        )
+                byte_candidates.append(
+                    _DcpMetadataByteCandidate(
+                        fqn=str(getattr(template_leaf, "unique_key", sharded_key)),
+                        path=path,
+                        template_leaf=template_leaf,
+                        is_main_replica=is_main_replica(template_leaf.replica_id),
                     )
-                byte_extra_state_index += 1
+                )
                 continue
             raise WeightedMergeError(
                 "direct-dcp-streaming currently supports tensor or ShardedObject "
@@ -1964,6 +2020,7 @@ def _build_direct_dcp_write_specs(
             )
         )
 
+    byte_specs = _select_direct_dcp_byte_specs(byte_candidates)
     return write_specs, byte_specs, merge_chunk_count
 
 
