@@ -1161,6 +1161,39 @@ def _select_direct_dcp_byte_specs(
     return byte_specs
 
 
+def _read_public_dcp_byte_metadata(checkpoint_dir: Path) -> dict[str, BytesStorageMetadata]:
+    try:
+        metadata = FileSystemReader(checkpoint_dir).read_metadata()
+    except (Exception, CheckpointException) as exc:
+        raise WeightedMergeError(
+            f"Could not read public DCP byte metadata from {checkpoint_dir}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    return {
+        str(fqn): metadata_entry
+        for fqn, metadata_entry in metadata.state_dict_metadata.items()
+        if isinstance(metadata_entry, BytesStorageMetadata)
+    }
+
+
+def _direct_dcp_byte_candidate_from_sharded_object(
+    *,
+    template_leaf: ShardedObject,
+    path: tuple[Union[str, int], ...],
+    source_byte_metadata: dict[str, BytesStorageMetadata],
+) -> Optional[_DcpMetadataByteCandidate]:
+    fqn = str(template_leaf.unique_key)
+    if fqn not in source_byte_metadata:
+        return None
+    return _DcpMetadataByteCandidate(
+        fqn=fqn,
+        path=path,
+        template_leaf=template_leaf.without_data(),
+        is_main_replica=is_main_replica(template_leaf.replica_id),
+    )
+
+
 def _git_revision() -> Optional[str]:
     try:
         result = subprocess.run(
@@ -1938,6 +1971,7 @@ def _build_direct_dcp_write_specs(
     extra_paths: list[tuple[Union[str, int], ...]],
     initial_template: ShardedStateDict,
     tensor_metadata_by_checkpoint: list[dict[str, Any]],
+    byte_metadata_by_checkpoint: list[dict[str, BytesStorageMetadata]],
     extra_state_source_index: int,
     streaming_chunk_bytes: int,
 ) -> tuple[list[_DirectDcpWriteSpec], list[_DcpMetadataByteSpec], int]:
@@ -2042,6 +2076,7 @@ def _build_direct_dcp_write_specs(
         )
 
     extra_metadata = tensor_metadata_by_checkpoint[extra_state_source_index]
+    extra_byte_metadata = byte_metadata_by_checkpoint[extra_state_source_index]
     for path in extra_paths:
         template_leaf = _get_path(initial_template, path)
         sharded_key = getattr(template_leaf, "key", None)
@@ -2051,6 +2086,19 @@ def _build_direct_dcp_write_specs(
                 f"'{_path_label(path, template_leaf)}'."
             )
         template_tensor = _as_tensor(template_leaf)
+        if isinstance(template_leaf, ShardedObject) and sharded_key not in extra_metadata:
+            byte_candidate = _direct_dcp_byte_candidate_from_sharded_object(
+                template_leaf=template_leaf,
+                path=path,
+                source_byte_metadata=extra_byte_metadata,
+            )
+            if byte_candidate is None:
+                raise WeightedMergeError(
+                    f"Checkpoint {extra_state_source_index} is missing byte/object metadata for "
+                    f"_extra_state '{_path_label(path, template_leaf)}'."
+                )
+            byte_candidates.append(byte_candidate)
+            continue
         if template_tensor is None:
             if isinstance(template_leaf, ShardedObject):
                 byte_candidates.append(
@@ -2721,6 +2769,7 @@ def _merge_direct_dcp_streaming(
     )
 
     tensor_metadata_by_checkpoint = []
+    byte_metadata_by_checkpoint = []
     bytes_read = 0
     for checkpoint_dir in resolved_input_dirs:
         tensor_metadata_by_checkpoint.append(
@@ -2728,6 +2777,7 @@ def _merge_direct_dcp_streaming(
                 str(checkpoint_dir), streaming_load_strategies[checkpoint_dir]
             )
         )
+        byte_metadata_by_checkpoint.append(_read_public_dcp_byte_metadata(checkpoint_dir))
         bytes_read += _directory_size_for_accounting(checkpoint_dir, byte_accounting)
 
     target_dtype_override = SAVE_DTYPE_MAP.get(save_dtype)
@@ -2748,6 +2798,7 @@ def _merge_direct_dcp_streaming(
         extra_paths=extra_paths,
         initial_template=initial_template,
         tensor_metadata_by_checkpoint=tensor_metadata_by_checkpoint,
+        byte_metadata_by_checkpoint=byte_metadata_by_checkpoint,
         extra_state_source_index=extra_state_source_index,
         streaming_chunk_bytes=streaming_chunk_bytes,
     )

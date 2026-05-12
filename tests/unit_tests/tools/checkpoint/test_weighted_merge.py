@@ -473,6 +473,14 @@ def _object_extra_template(extra_value=0):
     }
 
 
+def _tensor_like_object_extra_template(extra_value=0):
+    template = _object_extra_template(extra_value)
+    extra_state = template["model"]["decoder.layers.0._extra_state"]
+    extra_state.data = torch.empty((1,), dtype=torch.float32)
+    assert weighted_merge_module._as_tensor(extra_state) is not None
+    return template
+
+
 def _write_object_extra_checkpoint(path, value, extra_value, iteration):
     state_dict = _object_extra_template(extra_value)
     state_dict["model"]["weight"].data.fill_(value)
@@ -3124,6 +3132,49 @@ def test_direct_dcp_streaming_copies_object_extra_state(tmp_path_dist_ckpt, proc
             if type(entry).__name__ == "BytesStorageMetadata"
         )
         assert byte_keys == ["model.decoder.layers.0._extra_state/shard_0_1"]
+
+
+def test_direct_dcp_streaming_copies_byte_extra_state_for_tensor_like_object_template(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_tensor_like_object_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_direct_tensor_like_object_b") as ckpt_b,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "weighted_merge_direct_tensor_like_object_out"
+        ) as output_root,
+    ):
+        _write_object_extra_checkpoint(ckpt_a, 1.0, extra_value=111, iteration=1)
+        _write_object_extra_checkpoint(ckpt_b, 5.0, extra_value=999, iteration=2)
+
+        object_key = "model.decoder.layers.0._extra_state/shard_0_1"
+        source_metadata = torch_dcp.FileSystemReader(ckpt_b).read_metadata()
+        assert type(source_metadata.state_dict_metadata[object_key]).__name__ == (
+            "BytesStorageMetadata"
+        )
+
+        result = merge_sharded_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root / "merged",
+            lambda: _tensor_like_object_extra_template(),
+            execution_mode="direct-dcp-streaming",
+            streaming_chunk_bytes=16,
+            extra_state_source_index=1,
+            verify_load=True,
+        )
+        loaded = dist_checkpointing.load(_object_extra_template(), str(result.output_dir))
+
+        assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 4.0))
+        assert _decode_sharded_object_value(
+            loaded["model"]["decoder.layers.0._extra_state"]
+        ) == {"value": 999}
+
+        output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+        assert type(output_metadata.state_dict_metadata[object_key]).__name__ == (
+            "BytesStorageMetadata"
+        )
+        assert result.copied_extra_states == 1
 
 
 def test_direct_dcp_streaming_two_rank_copies_rank_local_object_extra_state(
