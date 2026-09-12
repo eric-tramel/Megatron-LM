@@ -470,6 +470,10 @@ def main():
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
             json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
+            json_results["async_sched_step_count"] = engine.context.async_sched_step_count
+            json_results["async_sched_compaction_step_count"] = (
+                engine.context.async_sched_compaction_step_count
+            )
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
@@ -508,7 +512,7 @@ def main():
         print(
             f"{setup_prefix} … " f"throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
-            f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+            f"mem {peak_alloc_gb:.1f} allocated/{peak_resvd_gb:.1f} reserved GB … "
             f"steps: {engine.context.step_count:d} … "
             f"capture {capture_str}",
         )
