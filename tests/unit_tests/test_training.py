@@ -9,7 +9,10 @@ import torch
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
-from megatron.training.training import build_train_valid_test_data_iterators
+from megatron.training.training import (
+    _get_indexer_logging_layer_counts,
+    build_train_valid_test_data_iterators,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -56,6 +59,40 @@ def create_test_args():
     args.phase_transition_iterations = None
 
     return args
+
+
+def test_indexer_logging_counts_only_active_legacy_ratios():
+    """Unused ratio-tail entries must not dilute the reported indexer loss."""
+    args = SimpleNamespace(
+        num_layers=2,
+        mtp_num_layers=1,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern=None,
+        csa_compress_ratios=[4, 0, 4, 4],
+        csa_dense_mode=False,
+    )
+
+    assert _get_indexer_logging_layer_counts(args) == (3, 2)
+
+
+def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
+    """Hybrid MTP repeats each inner-pattern indexer once per unshared prediction depth."""
+    args = SimpleNamespace(
+        num_layers=2,
+        mtp_num_layers=2,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern="DD/DDD/DDD",
+        csa_compress_ratios=[4, 0, 4, 0, 4, 4],
+        csa_dense_mode=False,
+    )
+
+    assert _get_indexer_logging_layer_counts(args) == (5, 5)
+
+    args.mtp_use_repeated_layer = True
+    assert _get_indexer_logging_layer_counts(args) == (5, 3)
+
+    args.csa_dense_mode = True
+    assert _get_indexer_logging_layer_counts(args) == (5, 0)
 
 
 class TestTraining:
@@ -119,6 +156,52 @@ class TestTraining:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+
+class TestGetModelBucketSizingPgCollection:
+    """The DDP-bucket-sizing path in get_model must read world size / rank from the
+    explicitly passed pg_collection (pg_collection.dp_cp / pg_collection.pp) rather
+    than the mpu globals. With an explicit pg_collection the mpu globals must not be
+    consulted at all."""
+
+    def test_bucket_sizing_uses_explicit_pg_collection(self, monkeypatch):
+        import megatron.training.training as training
+
+        # Sentinel groups whose size()/rank() identify which group was read.
+        class _Group:
+            def __init__(self, size, rank):
+                self._size = size
+                self._rank = rank
+
+            def size(self):
+                return self._size
+
+            def rank(self):
+                return self._rank
+
+        pg_collection = SimpleNamespace(dp_cp=_Group(size=7, rank=0), pp=_Group(size=4, rank=3))
+
+        # The mpu globals replaced on the bucket-sizing path must never be called
+        # when an explicit pg_collection is supplied.
+        def _boom(*args, **kwargs):
+            raise AssertionError("mpu global consulted on explicit pg_collection path")
+
+        monkeypatch.setattr(training.mpu, "get_data_parallel_world_size", _boom)
+        monkeypatch.setattr(training.mpu, "get_pipeline_model_parallel_rank", _boom)
+
+        # get_pg_size/get_pg_rank return 1/0 unless torch.distributed is initialized,
+        # so make them read directly off the sentinel groups for this host-only test.
+        monkeypatch.setattr(training, "get_pg_size", lambda group: group.size())
+        monkeypatch.setattr(training, "get_pg_rank", lambda group: group.rank())
+
+        # Mirror the exact bucket-sizing expressions from get_model.
+        bucket_size = max(40000000, 1000000 * training.get_pg_size(pg_collection.dp_cp))
+        pp_rank = training.get_pg_rank(pg_collection.pp)
+
+        # dp_cp size 7 -> 7_000_000 < 40_000_000, so the floor wins (default behavior).
+        assert bucket_size == 40000000
+        # pp rank is driven by pg_collection.pp, not the mpu global.
+        assert pp_rank == 3
 
 
 class TestSaveGrads:

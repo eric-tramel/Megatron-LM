@@ -2,6 +2,11 @@
 
 set -exo pipefail
 
+is_sensitive_env_name() {
+    local name="${1^^}"
+    [[ "$name" == *KEY* || "$name" == *TOKEN* || "$name" == *API* ]]
+}
+
 # Increase soft limit for number of open files to match hard limit
 ulimit -Sn $(ulimit -Hn)
 
@@ -25,7 +30,11 @@ for ARGUMENT in "$@"; do
 
     # Properly quote the value to preserve spaces and special characters
     export "$KEY"="$(eval echo $VALUE)"
-    echo "$KEY=$VALUE"
+    if is_sensitive_env_name "$KEY"; then
+        printf '%s=<redacted>\n' "$KEY"
+    else
+        printf '%s=%s\n' "$KEY" "$VALUE"
+    fi
 done
 set -x
 
@@ -40,7 +49,6 @@ MANDATORY_VARS=(
     "CHECKPOINT_LOAD_PATH"
     "DATA_PATH"
     "DATA_CACHE_PATH"
-    "ENABLE_LIGHTWEIGHT_MODE"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -56,8 +64,14 @@ TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
 TEST_EVALUATION=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_EVALUATION // "pass"')
-ENABLE_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
+CONFIG_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
+ENV_LIGHTWEIGHT_MODE="${ENABLE_LIGHTWEIGHT_MODE:-false}"
+if [[ "$ENV_LIGHTWEIGHT_MODE" == "true" || "$CONFIG_LIGHTWEIGHT_MODE" == "true" ]]; then
+    export ENABLE_LIGHTWEIGHT_MODE=true
+else
+    export ENABLE_LIGHTWEIGHT_MODE=false
+fi
 N_REPEAT=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.N_REPEAT // "'$N_REPEAT'"')
 MODE=$(cat $TRAINING_PARAMS_PATH |
@@ -372,7 +386,7 @@ for i in $(seq 1 $N_REPEAT); do
         SKIP_PYTEST=1
     fi
 
-    if [[ ${SKIP_PYTEST:-0} != 1 || "$TEST_TYPE" == "release" ]]; then
+    if [[ "$NODE_RANK" -eq 0 && (${SKIP_PYTEST:-0} != 1 || "$TEST_TYPE" == "release") ]]; then
         # Save run results
         export PYTHONPATH=$ROOT_DIR
         if [[ "$TEST_TYPE" == "release" ]]; then
@@ -424,7 +438,7 @@ for i in $(seq 1 $N_REPEAT); do
         ALLOW_NONDETERMINISTIC_ALGO_ARG="--allow-nondeterministic-algo"
     fi
 
-    if [[ "$SLURM_NODEID" -eq 0 ]]; then
+    if [[ "$NODE_RANK" -eq 0 ]]; then
         echo "Running pytest checks against golden values"
 
         # For pretraining jobs

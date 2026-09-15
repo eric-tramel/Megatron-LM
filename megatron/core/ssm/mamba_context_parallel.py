@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel import all_to_all
+from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
 from megatron.core.utils import is_te_min_version
 
 try:
@@ -59,6 +59,7 @@ class MambaContextParallel:
             The A_log parameter which would be used on this tp rank if cp_size was 1
         D_cp1 (torch.Tensor): The D parameter which would be used on this tp rank if cp_size was 1
         D_has_hdim (bool): D parameter is sized to hidden dimension, rather than being per-head
+        sequence_is_contiguous (bool): Whether CP ranks already hold contiguous causal intervals.
     """
 
     def __init__(
@@ -75,6 +76,7 @@ class MambaContextParallel:
         A_log_cp1: torch.Tensor,
         D_cp1: torch.Tensor,
         D_has_hdim: bool,
+        sequence_is_contiguous: bool = False,
     ) -> None:
         if not HAVE_EINOPS:
             raise ImportError("einops is required by the Mamba model but cannot be imported")
@@ -91,6 +93,7 @@ class MambaContextParallel:
         self.A_log_cp1 = A_log_cp1
         self.D_cp1 = D_cp1
         self.D_has_hdim = D_has_hdim
+        self.sequence_is_contiguous = sequence_is_contiguous
 
         self.cp_size = self.cp_group.size()
 
@@ -193,8 +196,8 @@ class MambaContextParallel:
         dt = _all_to_all_cp2hp(dt, self.cp_group)
 
         output = torch.cat([z, x, B, C, dt], dim=-1)
-        # TODO(duncan): for hybrid models, consider isolating load-balancing to attention layers
-        output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
+        if not self.sequence_is_contiguous:
+            output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
 
         return output
 
@@ -204,11 +207,9 @@ class MambaContextParallel:
         """Method to be applied after the convolution and SSM"""
         if self.cp_size == 1:
             return input_
-        else:
-            return _all_to_all_hp2cp(
-                _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params),
-                self.cp_group,
-            )
+        if not self.sequence_is_contiguous:
+            input_ = _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params)
+        return _all_to_all_hp2cp(input_, self.cp_group)
 
     def conv1d(self, input_: torch.Tensor) -> torch.Tensor:
         """
@@ -302,7 +303,6 @@ class MambaContextParallel:
         return param[start:end]
 
 
-# TODO(duncan): Consider combining with all_to_all_sp2hp in mappings.py and using einops.rearrange
 def _all_to_all_cp2hp(
     input_: torch.Tensor, cp_group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
@@ -324,24 +324,12 @@ def _all_to_all_cp2hp(
     """
     assert input_.dim() == 3, "all_to_all_cp2hp assumes 3-d input shape."
     s_in, b_in, h_in = input_.shape
-    # Squash the first two dimensions -> [s*b, h]
-    input_ = input_.reshape(-1, h_in)
-    # Split into world_size chunks along the h dimension
-    world_size = cp_group.size()
-    h_out = h_in // world_size
-    split_tensors = torch.split(input_, split_size_or_sections=h_out, dim=1)
-    # Concat the chunks along the s*b dimension
-    concat_tensor = torch.cat(split_tensors, dim=0)
-    # TODO(duncan): Can the following be optimized by using the non-single (tensor list) version of
-    # all-to-all?
-    # Swap chunks of dim0 across the cp ranks
-    output = all_to_all(cp_group, concat_tensor)
-    # Recover the s and b dimensions
-    output = output.reshape(s_in * world_size, b_in, h_out)
+    s_out, h_out = s_in * cp_group.size(), h_in // cp_group.size()
+    output = all_to_all_sp2hp(input_, group=cp_group)
+    output = output.reshape(s_out, b_in, h_out)
     return output
 
 
-# TODO(duncan): Consider combining with all_to_all_hp2sp in mappings.py and using einops.rearrange
 def _all_to_all_hp2cp(
     input_: torch.Tensor, cp_group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
@@ -363,18 +351,9 @@ def _all_to_all_hp2cp(
     """
     assert input_.dim() == 3, "all_to_all_hp2cp assumes 3-d input shape."
     s_in, b_in, h_in = input_.shape
-    # Squash the first two dimensions -> [s*b, h]
-    input_ = input_.reshape(-1, h_in)
-    # Swap chunks of dim0 across the cp ranks
-    input_exchanged = all_to_all(cp_group, input_)
-    # Split into world_size chunks along the s*b dimension
-    world_size = cp_group.size()
-    s_out = s_in // world_size
-    split_tensors = torch.split(input_exchanged, split_size_or_sections=s_out * b_in, dim=0)
-    # Concat the chunks along the h dimension
-    output = torch.cat(split_tensors, dim=-1)
-    # Recover the s and b dimensions
-    output = output.reshape(s_out, b_in, h_in * world_size)
+    s_out, h_out = s_in // cp_group.size(), h_in * cp_group.size()
+    output = all_to_all_hp2sp(input_, group=cp_group)
+    output = output.reshape(s_out, b_in, h_out)
     return output
 
 
